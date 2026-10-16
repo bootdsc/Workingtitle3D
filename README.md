@@ -46,14 +46,14 @@ don't use it and really don't feel obligated to tell me or anyone else just go e
 
 ## Run
 Download the latest release - open Workingtitle3D.html in a Chromium-based browser (Chromium itself is preferred,
-Vivaldi and Brave also good options). There is no install no bloat. Firefox is not supported due to how it handles file saving,
-it requires a workaround not worth doing.
+Vivaldi and Brave also good options). There is no install no bloat. Firefox and Safari work too: there auto save keeps
+your project inside the browser on that computer, and Save file writes a copy you can keep anywhere.
 
-Brave keeps folder access switched off by default. To use brave and have auto save you must flip a switch in brave,
-go to the address bar and input brave://flags/#file-system-access-api select enable and launch Workingtitle3D easy as.
-This change allows autosaving and you can instead manually save its an option you are not forced to enable anything but,
-autosave really is a must the software is not perfect non of them ever are but with auto save if there's ever a crash,
-refresh the page and everything is back how you left it in 2 seconds.
+Brave keeps folder access switched off by default, so out of the box it auto saves inside the browser like Firefox.
+To have auto save write to a real folder instead, go to the address bar and input brave://flags/#file-system-access-api
+select enable and launch Workingtitle3D easy as. Either way auto save really is a must the software is not perfect non
+of them ever are but with auto save if there's ever a crash, reload the page and File > Reopen puts everything back how
+you left it, with the option to undo the last action first in case that is what crashed it.
 
 To build it yourself:
 

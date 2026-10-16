@@ -132,22 +132,28 @@ try {
   await sleep(800);
   step('redo brings it back', (await vol()) === v2);
 
-  // history slider: step 1 shows the first box (the group did not exist yet, so no Keep);
-  // the step before the fillet can be kept, which rolls the group back; Ctrl+Z undoes it
+  // history slider: the group's forms (made, then filleted), not where it has been. Setting
+  // step 1 takes the fillet off and leaves the group where it is; step 2 puts it back (the list
+  // keeps later forms); Ctrl+Z undoes a step. Other parts stay shown unless Hide other parts.
+  const cx = async () => page.$$eval('.inspector .field', fs => +fs.find(f => f.querySelector('label').textContent === 'Center X').querySelector('input').value);
   const n = await page.$$eval('.inspector .slider input[type=range]', r => +r[0].max);
+  const hx0 = await cx();
   await field('Step (of ' + n + ')', 1);
+  await waitStatus(/history step 1|ERROR/);
+  await sleep(500);
+  const vk = await vol(), hx1 = await cx();
   const lab1 = await page.$eval('.inspector .slider + .note', e => e.textContent);
-  const keepOff1 = await page.evaluate(() => [...document.querySelectorAll('.inspector .btn')].find(b => b.textContent === 'Keep this').disabled);
   await shot('3b-history-step1');
-  await field('Step (of ' + n + ')', n - 1);
-  const keepOff2 = await page.evaluate(() => [...document.querySelectorAll('.inspector .btn')].find(b => b.textContent === 'Keep this').disabled);
-  await click('.inspector .btn', 'Keep this');
-  await sleep(800);
-  const vk = await vol();
-  step('history slider', /Add Box 1/.test(lab1) && keepOff1 && !keepOff2 && vk === v1, `${n} steps; step 1: "${lab1.slice(0, 40)}"; kept vol ${vk} (want ${v1})`);
+  step('history: step 1 is the form before the fillet, in place', n === 2 && vk === v1 && Math.abs(hx1 - hx0) < 0.05 && /Group 2 parts/.test(lab1), `${n} forms; "${lab1}"; vol ${vk} (want ${v1}); centre X ${hx0} -> ${hx1}`);
+  await field('Step (of ' + n + ')', 2);
+  await waitStatus(/history step 2|ERROR/);
+  await sleep(500);
+  step('history: forward again to the fillet', (await vol()) === v2, `${await vol()} (want ${v2})`);
   await keys('Control', 'z');
   await sleep(800);
-  step('undo the keep', (await vol()) === v2);
+  step('history: Ctrl+Z undoes a history step', (await vol()) === v1, `${await vol()}`);
+  await keys('Control', 'y');
+  await sleep(800);
 
   // import, drag
   await (await page.$('input[type=file]')).uploadFile(part);
@@ -191,14 +197,24 @@ try {
   await shot('4-scene-1920');
   await page.setViewport({ width: 1366, height: 768 });
 
-  // color
-  await click('.inspector .btn', 'Color');
-  await page.click('.palette .sw[title="Red"]');
-  await sleep(300);
-  step('color picked, named in text', (await page.$eval('.inspector .cname', e => e.textContent)) === 'Red');
+  // color: one button with the color's name; its list opens to the left of the panel and the
+  // panel does not move; a part with no color reads Gray
+  const name0 = await page.$eval('.inspector .colorbtn', e => e.textContent);
+  const panelH0 = await page.$eval('aside .pane:not([style*="none"])', e => e.scrollHeight);
+  await page.click('.inspector .colorbtn');
+  await sleep(200);
+  const fly = await page.evaluate(() => { const f = document.querySelector('.colorfly'), a = document.querySelector('aside'); const r = f.getBoundingClientRect(); return { shown: f.style.display !== 'none', right: r.right, left: a.getBoundingClientRect().left, bottom: r.bottom, h: innerHeight }; });
+  const panelH1 = await page.$eval('aside .pane:not([style*="none"])', e => e.scrollHeight);
+  await shot('4a-color-list');
+  for (const b of await page.$$('.colorfly .citem')) if ((await b.evaluate(n => n.textContent)).endsWith('Red')) { await b.click(); break; }
+  await sleep(400);
+  const name1 = await page.$eval('.inspector .colorbtn', e => e.textContent);
+  step('color: named button, list left of the panel, panel still', name0 === 'Gray' && name1 === 'Red' && fly.shown && fly.right <= fly.left && fly.bottom <= fly.h && panelH1 === panelH0,
+    `${name0} -> ${name1}; list right ${fly.right} vs panel ${fly.left}; panel ${panelH0} -> ${panelH1}`);
 
-  // options sit under the selected row; double-click the row renames in place; the arrow folds
-  const under = await page.$eval('.prow.on', r => r.nextElementSibling?.classList.contains('inspector'));
+  // the parts list: a flyout left of the panel; double-click renames in place; Close shuts
+  // it and the Parts tab opens it again; All and None select
+  const pf = await page.evaluate(() => { const f = document.querySelector('.partfly'), a = document.querySelector('aside'); return f.style.display !== 'none' && f.getBoundingClientRect().right <= a.getBoundingClientRect().left; });
   await (await page.$('.prow.on')).click({ count: 2 });
   await page.waitForSelector('.parts > input.name-in');
   await page.$eval('.parts > input.name-in', i => { i.value = ''; });
@@ -206,12 +222,19 @@ try {
   await page.keyboard.press('Enter');
   await sleep(400);
   const renamed = (await parts()).some(t => t.includes('Lid'));
-  await page.click('.prow.on .fold');
-  await sleep(200);
-  const folded = await page.$eval('.inspector', e => e.style.display === 'none');
-  await page.click('.prow.on .fold');
-  await sleep(200);
-  step('options under the row, rename in place, fold', under && renamed && folded, `under ${under}, renamed ${renamed}, folded ${folded}`);
+  await click('.partfly .btn', 'Close');
+  const shut = await page.$eval('.partfly', e => e.style.display === 'none');
+  await click('.tabs button', 'Parts');
+  const back = await page.$eval('.partfly', e => e.style.display !== 'none');
+  await click('.partfly .btn', 'All');
+  await sleep(300);
+  const nAll = await page.$$eval('.prow.on', r => r.length);
+  await click('.partfly .btn', 'None');
+  await sleep(300);
+  const nNone = await page.$$eval('.prow.on', r => r.length);
+  step('parts list beside the panel, rename, close, reopen, all, none', pf && renamed && shut && back && nAll === 2 && nNone === 0, `beside ${pf}, renamed ${renamed}, shut ${shut}, back ${back}, all ${nAll}, none ${nNone}`);
+  for (const r of await page.$$('.prow')) if ((await r.evaluate(n => n.textContent)).includes('Lid')) { await r.click(); break; }
+  await sleep(300);
   await shot('4b-parts-panel');
 
   // arrows follow the view: top view right = +X; right view right = +Y
@@ -290,8 +313,8 @@ try {
   await click('header .btn', 'Save as project');
   await page.waitForSelector('dialog[open]');
   const msg = await page.$eval('dialog[open]', d => d.textContent);
-  step('no folder access explained', /switched off/.test(msg) && /brave:\/\/flags/.test(msg));
-  await click('dialog .btn', 'OK');
+  step('no folder access: projects kept in the browser, and it says so', /in this browser/.test(msg) && /no folder access/.test(msg), msg.slice(0, 120));
+  await click('dialog .btn', 'Cancel');
 
   // rotation turns about the part's middle; Bottom Z shows where it really sits
   await addShape('Box');
@@ -392,8 +415,24 @@ try {
   await addShape('Cylinder');
   await sleep(1500);
   await page.reload();
+  // a reload starts empty (it is nearly always after a crash); File > Reopen brings it back
+  await sleep(1500);
+  const empty = await page.evaluate(() => document.getElementById('view').viewer.objs.size);
+  await menuItem('File', 'Reopen Test case');
+  await page.waitForSelector('dialog[open]');
+  await click('dialog[open] .btn', 'Reopen');
   const reopened = await waitStatus(/Opened|ERROR/, 15000).catch(e => e.message);
-  step('project reopens itself after a reload', /Opened Test case: 2 parts/.test(reopened), reopened);
+  step('reload starts empty; File > Reopen brings the project back', empty === 0 && /Opened Test case: 2 parts/.test(reopened), `${empty} parts after reload; ${reopened}`);
+  // Reopen with "Undo last action before loading": the last step (the cylinder) is not built
+  await page.reload();
+  await sleep(1500);
+  await menuItem('File', 'Reopen Test case');
+  await page.waitForSelector('dialog[open]');
+  await page.$eval('dialog[open] input[type=checkbox]', c => c.click());
+  await click('dialog[open] .btn', 'Reopen');
+  const undone = await waitStatus(/Opened|ERROR/, 15000).catch(e => e.message);
+  step('Reopen with the last action undone first', /Opened Test case: 1 parts/.test(undone) && /undone: Add Cylinder/.test(undone), undone);
+  await keys('Control', 'y'); await sleep(800);
   await menuItem('File', 'Open...');
   await page.waitForSelector('dialog[open] .projlist');
   const listed = await page.$$eval('dialog[open] .projlist .btn', b => b.map(x => x.textContent));
@@ -414,8 +453,10 @@ try {
   const r = report(readSTL(Uint8Array.from(bytes).buffer));
   step('export + read back', r.watertight, `${r.triangles} tris  ${describe(r)}  vol ${r.volume.toFixed(0)}`);
 
-  // rename: click the project name box; the folder moves, the next step lands in the new one
-  await page.click('header .file');
+  // no project name box in the view at all: the name and saved state are in the window title
+  step('no name box in the view; name in the title', !(await page.$('header .file')) && /Test case-?\d*|Test case/.test(await page.title()), await page.title());
+  // rename: File > Rename project; the folder moves, the next step lands in the new one
+  await menuItem('File', 'Rename project...');
   await page.waitForSelector('dialog[open] input.name-in');
   await page.$eval('dialog[open] input.name-in', i => { i.value = 'Renamed case'; });
   await click('dialog .btn', 'Save');
@@ -426,7 +467,7 @@ try {
     const pd = await (await (await navigator.storage.getDirectory()).getDirectoryHandle('home')).getDirectoryHandle('projects');
     const names = []; for await (const [n] of pd.entries()) names.push(n);
     const j = await (await (await (await pd.getDirectoryHandle('Renamed case')).getFileHandle('journal.ndjson')).getFile()).text();
-    return { names, label: document.querySelector('header .file').textContent, lastStep: j.trim().split('\n').pop() };
+    return { names, label: document.title, lastStep: j.trim().split('\n').pop() };
   });
   step('rename the project', /Renamed case/.test(after.label) && after.names.includes('Renamed case') && !after.names.includes('Test case') && /Sphere/.test(after.lastStep),
     `${rn.slice(0, 50)} | ${after.names.join(', ')} | ${after.label}`);
@@ -434,13 +475,15 @@ try {
   // a shape added on Shape tools is edited there, no tab change; Parts takes the options back
   await click('.tabs button', 'Shape tools');
   await click('.shapes .btn', 'Cylinder');
+  await sleep(300);
+  await page.keyboard.press('Enter');
   await sleep(800);
   await shot('shape-tab-opts');
-  const onShapes = await page.evaluate(() => { const o = document.querySelector('.shapeopts');
-    return o.style.display !== 'none' && !!o.querySelector('.inspector') && /Diameter/.test(o.textContent) && !document.querySelector('.parts .inspector'); });
+  const onShapes = await page.evaluate(() => { const o = document.querySelector('.pane .shapes').closest('.pane').querySelector('.shapeopts');
+    return o.style.display !== 'none' && !!o.querySelector('.inspector') && /Diameter/.test(o.textContent) && /Color/.test(o.textContent); });
   await click('.tabs button', 'Parts');
-  const onParts = await page.evaluate(() => !!document.querySelector('.parts > .inspector') && document.querySelector('.parts > .inspector').style.display !== 'none');
-  step('options under Shape tools after adding', onShapes && onParts, `${onShapes} ${onParts}`);
+  const onParts = await page.evaluate(() => { const o = document.querySelector('.pane:not(:has(.shapes)) .shapeopts'); return o.style.display !== 'none' && !!o.querySelector('.inspector') && o.querySelector('.inspector').style.display !== 'none'; });
+  step('options under Shape tools after adding, then on Parts', onShapes && onParts, `${onShapes} ${onParts}`);
 
   // a driver reset (resume from sleep) loses the GL context: say so, then redraw on restore
   await page.evaluate(() => { window._lc = document.querySelector('#view canvas').getContext('webgl2').getExtension('WEBGL_lose_context'); window._lc.loseContext(); });

@@ -6,6 +6,7 @@
 // left drag on empty space draws a selection box.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { MeshBVH } from 'three-mesh-bvh';
 import { faultEdges } from './meshcheck.js';
 
 const C = { bg: 0x0a0a0a, body: 0x9c9c9c, bodySel: 0xc8c8c8, inside: 0x2d5a2d, edge: 0x000000, edgeSel: 0x7dcf7d,
@@ -14,9 +15,11 @@ const C = { bg: 0x0a0a0a, body: 0x9c9c9c, bodySel: 0xc8c8c8, inside: 0x2d5a2d, e
 export class Viewer {
   constructor(el) {
     this.el = el;
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
+    // alpha: a background picture can sit behind the view; the clear stays opaque until one does
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setClearColor(C.bg);
+    this.bgColor = C.bg;
+    this.renderer.setClearColor(C.bg, 1);
     this.renderer.localClippingEnabled = true;
     el.appendChild(this.renderer.domElement);
     const dom = this.renderer.domElement;
@@ -35,8 +38,9 @@ export class Viewer {
     this.camera.position.set(160, -220, 170);
     this.controls = new OrbitControls(this.camera, dom);
     this.controls.enableDamping = true;
-    // the wheel is ours: towards the point under the pointer, 5% of the way per notch but never
-    // under 1 mm, so close up keeps a steady pace instead of crawling towards it for ever
+    // the wheel is ours: towards the point under the pointer, 15% of the way per notch but never
+    // under 3 mm, so close up keeps a steady pace instead of crawling towards it for ever; at a
+    // surface it carries on through, so the inside of a part can be seen
     this.controls.enableZoom = false;
     dom.addEventListener('wheel', e => {
       e.preventDefault();
@@ -46,8 +50,17 @@ export class Viewer {
       let p = h ? h.point.clone() : null;
       if (!p) { p = new THREE.Vector3(); if (!ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), 0), p) || p.distanceTo(this.camera.position) > 1e5) p = ray.at(this.camera.position.distanceTo(this.controls.target), new THREE.Vector3()); }
       const d = this.camera.position.distanceTo(p);
-      let step = Math.max(d * 0.05, 1) * Math.abs(notches);
-      if (notches < 0 && step > d - 0.5) step = Math.max(0, d - 0.5);   // stop half a millimetre short
+      const step = Math.max(d * 0.15, 3) * Math.abs(notches);   // three times the old 5% / 1 mm
+      if (notches < 0 && step > d - 0.5) {
+        // at the surface: go on through it, along the pointer's ray, camera and orbit point
+        // together; inside a part it turns see-through (updateInside)
+        const v = ray.direction.clone().multiplyScalar(step);
+        this.camera.position.add(v);
+        this.controls.target.add(v);
+        this.controls.update();
+        this.request();
+        return;
+      }
       // camera and orbit point both scale towards (or away from) the point: the view direction
       // never changes, so nothing turns
       const k = notches < 0 ? 1 - step / d : 1 + step / d;
@@ -72,7 +85,7 @@ export class Viewer {
     this.mats = {
       body: new THREE.MeshLambertMaterial({ color: C.body, flatShading: true, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }),
       bodySel: new THREE.MeshLambertMaterial({ color: C.bodySel, flatShading: true, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }),
-      inside: new THREE.MeshBasicMaterial({ color: C.inside, side: THREE.BackSide }),
+      inside: new THREE.MeshBasicMaterial({ color: C.inside, side: THREE.BackSide, transparent: true, opacity: 0.18, depthWrite: false }),
       hole: new THREE.MeshLambertMaterial({ color: C.hole, flatShading: true, transparent: true, opacity: 0.28, depthWrite: false, side: THREE.DoubleSide }),
       edge: new THREE.LineBasicMaterial({ color: C.edge, transparent: true, opacity: 0.5 }),
       edgeSel: new THREE.LineBasicMaterial({ color: C.edgeSel }),
@@ -94,6 +107,7 @@ export class Viewer {
     this.onDragEnd = null;
     this.onHandle = null;      // (phase 'start'|'move'|'end', info, event) -> start returns bool
     this.initHandles();
+    this.initOutline();
 
     this.boxEl = document.createElement('div');
     this.boxEl.className = 'selbox';
@@ -112,6 +126,9 @@ export class Viewer {
       return ray.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), -z), p) ? p : null;
     };
     dom.addEventListener('contextmenu', e => e.preventDefault());
+    // a turn about to start (right button, or Ctrl + left): turn about what is in the middle of the
+    // screen (after panning and zooming the turning point drifted off into space)
+    dom.addEventListener('pointerdown', e => { if (e.button === 2 || (e.button === 0 && e.ctrlKey)) this.recentrePivot(); }, { capture: true });
     dom.addEventListener('pointerdown', e => {
       if (e.button !== 0) return;
       if (this.ghost) { e.stopPropagation(); this.onPlace?.('click', this.placeHit(e)); return; }
@@ -124,15 +141,18 @@ export class Viewer {
       const hh = this.hitHandle(e);
       if (hh) {
         const g = this.grab(hh, e);
-        if (g && this.onHandle?.('start', g.info, e) !== false) { down = { handle: g }; dom.setPointerCapture(e.pointerId); }
+        if (g && this.onHandle?.('start', g.info, e) !== false) { down = { handle: g }; try { dom.setPointerCapture(e.pointerId); } catch { /* the pointer is already up */ } }
         return;
       }
       const hit = this.hit(e);
       down = { x: e.clientX, y: e.clientY, hit, moving: false, boxing: false };
       if (hit) down.plane = plateAt(e, hit.point.z);
-      dom.setPointerCapture(e.pointerId);
+      try { dom.setPointerCapture(e.pointerId); } catch { /* the pointer is already up */ }
     });
+    this.plateAt = plateAt;
+    dom.addEventListener('pointerleave', () => { if (this.pointerAt) this.pointerAt.inView = false; });
     dom.addEventListener('pointermove', e => {
+      this.pointerAt = { clientX: e.clientX, clientY: e.clientY, shiftKey: e.shiftKey, inView: true };
       if (this.ghost) { this.onPlace?.('move', this.placeHit(e)); return; }
       if (!down) { this.hover(e); return; }
       if (down.handle) { this.onHandle?.('move', this.follow(down.handle, e), e); return; }
@@ -152,8 +172,18 @@ export class Viewer {
           width: Math.abs(e.clientX - down.x) + 'px', height: Math.abs(e.clientY - down.y) + 'px' });
       }
     });
+    // the release can be missed (the page busy when it came, or it landed outside the view): a
+    // move with the left button already up, or the pointer leaving the window, ends it just the same,
+    // so a part never stays stuck to the mouse
+    const lost = e => { if (down && !(e.buttons & 1)) finish(e); };
+    dom.addEventListener('pointermove', lost, { capture: true });
+    window.addEventListener('pointerup', e => { if (e.button === 0 && down && e.target !== dom) finish(e); });
+    window.addEventListener('blur', () => { if (down) finish({ clientX: down.x || 0, clientY: down.y || 0, button: 0, shiftKey: false }); });
     dom.addEventListener('pointerup', e => {
       if (e.button !== 0 || !down) return;
+      finish(e);
+    });
+    const finish = e => {
       const d = down;
       down = null;
       if (d.handle) { this.onHandle?.('end', this.follow(d.handle, e), e); return; }
@@ -164,7 +194,24 @@ export class Viewer {
         return;
       }
       this.onPick?.(d.hit ? d.hit.id : null, d.hit ? d.hit.face : -1, e);
-    });
+    };
+  }
+
+  /** Put the turning point on what the middle of the screen shows: the nearest part, else the
+   *  plate (z = 0). It lies on the line of sight, so the picture does not move; only the point
+   *  turns are made about. Nothing in the middle and the plate behind the camera: unchanged. */
+  recentrePivot() {
+    const r = this.renderer.domElement.getBoundingClientRect();
+    const mid = { clientX: r.left + r.width / 2, clientY: r.top + r.height / 2 };
+    const hit = this.hit(mid);
+    let p = hit?.point || null;
+    if (!p) {
+      const ray = this.ray(mid).ray, q = new THREE.Vector3();
+      if (ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 0, 1), 0), q) && q.distanceTo(this.camera.position) < this.camera.far) p = q;
+    }
+    if (!p || p.distanceTo(this.camera.position) < 1e-3) return;
+    this.controls.target.copy(p);
+    this.controls.update();
   }
 
   ray(e) {
@@ -177,9 +224,23 @@ export class Viewer {
   /** Nearest part under the pointer: {id, face (local triangle), point}. */
   hit(e) {
     const ray = this.ray(e);
-    const meshes = [...this.objs.values()].filter(o => o.group.visible).map(o => o.mesh);
-    const h = ray.intersectObjects(meshes, false).find(x => !(this.clipOn && this.clipPlane.distanceToPoint(x.point) < 0));
-    return h ? { id: h.object.userData.id, face: h.faceIndex, point: h.point } : null;
+    const vis = [...this.objs.values()].filter(o => o.group.visible);
+    // the cut away side of a part being cut cannot be picked; parts not being cut are whole
+    const keep = (id, p) => !(this.cutHere(id) && this.clipPlane.distanceToPoint(p) < 0);
+    const h = ray.intersectObjects(vis.filter(o => !o.pickBvh).map(o => o.mesh), false).find(x => keep(x.object.userData.id, x.point));
+    let best = h ? { id: h.object.userData.id, face: h.faceIndex, point: h.point, d: h.distance } : null;
+    // big parts: their search tree (built in the worker), so a press on them answers at once
+    for (const o of vis) {
+      if (!o.pickBvh) continue;
+      o.mesh.updateMatrixWorld();
+      const lr = ray.ray.clone().applyMatrix4(o.mesh.matrixWorld.clone().invert());
+      for (const x of o.pickBvh.raycast(lr, THREE.DoubleSide)) {
+        const p = x.point.clone().applyMatrix4(o.mesh.matrixWorld), d = p.distanceTo(ray.ray.origin);
+        if ((best && d >= best.d) || !keep(o.part.id, p)) continue;
+        best = { id: o.part.id, face: (o.pickIndex[x.faceIndex * 3] / 3) | 0, point: p, d };   // the tree's triangle back to the part's own
+      }
+    }
+    return best ? { id: best.id, face: best.face, point: best.point } : null;
   }
 
   /** Parts the selection box touches: any of the part's points (sampled), any of its
@@ -248,14 +309,94 @@ export class Viewer {
       // panning moves at the orbit point's depth; close up that would crawl, so never slower than at 20 mm
       this.controls.panSpeed = Math.max(1, 20 / Math.max(0.01, this.camera.position.distanceTo(this.controls.target)));
       this.updateGuides();
+      this.updateDepthRange();
       this.updateInside();
       this.renderer.render(this.scene, this.camera);
+      this.drawOutline();
     });
+  }
+
+  /** Near and far follow the camera, so zooming out never cuts the model off at the back and
+   *  coming close never cuts a surface open in front. Set before each frame. */
+  updateDepthRange() {
+    const cam = this.camera, d = cam.position.distanceTo(this.controls.target);
+    if (!this.sceneBox || this.sceneBoxDirty) {
+      const b = new THREE.Box3();
+      for (const o of this.objs.values()) if (o.group.visible) b.union(new THREE.Box3().setFromObject(o.mesh));
+      const [hw, hd] = this.plateHalf || [300, 300];
+      b.expandByPoint(new THREE.Vector3(-hw, -hd, 0)).expandByPoint(new THREE.Vector3(hw, hd, 0));
+      this.sceneBox = b; this.sceneBoxDirty = false;
+      this.sceneSphere = b.getBoundingSphere(new THREE.Sphere());
+    }
+    const s = this.sceneSphere;
+    const far = Math.max(cam.position.distanceTo(s.center) + s.radius, d * 4) * 1.5;
+    const near = Math.min(Math.max(0.01, d / 1000), far / 1000);
+    if (Math.abs(near - cam.near) > cam.near * 0.05 || Math.abs(far - cam.far) > cam.far * 0.05) {
+      cam.near = near; cam.far = far; cam.updateProjectionMatrix();
+    }
+  }
+
+  // ---- selection outline --------------------------------------------------------------------
+  // The selected parts are drawn white into a mask, then a ring of pixels just outside the mask
+  // is painted in the selection color. It follows the true silhouette of any shape (a cone's
+  // sloped sides as well as a box's edges); the feature lines still light up as before.
+  // Costs one extra draw of the selected parts only, and nothing when none is selected.
+  initOutline() {
+    this.maskRT = new THREE.WebGLRenderTarget(1, 1);
+    this.maskMat = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+    this.outlineMat = new THREE.ShaderMaterial({
+      uniforms: { mask: { value: this.maskRT.texture }, texel: { value: new THREE.Vector2(1, 1) }, color: { value: new THREE.Color(C.edgeSel) }, width: { value: 2 } },
+      vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
+      fragmentShader: `uniform sampler2D mask; uniform vec2 texel; uniform vec3 color; uniform float width; varying vec2 vUv;
+        void main() {
+          if (texture2D(mask, vUv).r > 0.5) discard;
+          float m = 0.0;
+          for (int i = 0; i < 16; i++) {
+            float a = float(i) * 0.3926991;
+            vec2 d = vec2(cos(a), sin(a)) * texel;
+            m = max(m, texture2D(mask, vUv + d * width).r);
+            m = max(m, texture2D(mask, vUv + d * width * 0.5).r);
+          }
+          if (m < 0.5) discard;
+          gl_FragColor = vec4(color, 1.0);
+          #include <colorspace_fragment>
+        }`,
+      depthTest: false, depthWrite: false, transparent: true,
+    });
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), this.outlineMat);
+    quad.frustumCulled = false;
+    this.outlineScene = new THREE.Scene();
+    this.outlineScene.add(quad);
+    this.outlineCam = new THREE.Camera();
+  }
+  drawOutline() {
+    const any = [...this.selected].some(id => { const o = this.objs.get(id); return o && o.group.visible && o.mesh.visible && this.root.visible; });
+    if (!any) return;
+    const r = this.renderer, size = r.getDrawingBufferSize(new THREE.Vector2());
+    if (this.maskRT.width !== size.x || this.maskRT.height !== size.y) this.maskRT.setSize(size.x, size.y);
+    this.outlineMat.uniforms.texel.value.set(1 / size.x, 1 / size.y);
+    this.outlineMat.uniforms.width.value = 2 * r.getPixelRatio();
+    this.maskMat.clippingPlanes = this.clipOn ? [this.clipPlane] : null;
+    const clear = r.getClearColor(new THREE.Color()), alpha = r.getClearAlpha(), layers = this.camera.layers.mask;
+    r.setRenderTarget(this.maskRT);
+    r.setClearColor(0x000000, 1);
+    r.clear();
+    this.camera.layers.set(2);
+    this.scene.overrideMaterial = this.maskMat;
+    r.render(this.scene, this.camera);
+    this.scene.overrideMaterial = null;
+    this.camera.layers.mask = layers;
+    r.setRenderTarget(null);
+    r.setClearColor(clear, alpha);
+    const auto = r.autoClear;
+    r.autoClear = false;
+    r.render(this.outlineScene, this.outlineCam);
+    r.autoClear = auto;
   }
 
   // ---- parts -------------------------------------------------------------------------------
   /** Show these parts. meshes: Map(id -> {key, tris}) in each part's own frame. */
-  sync(parts, meshes) {
+  sync(parts, meshes, keep = false) {
     const seen = new Set();
     for (const p of parts) {
       seen.add(p.id);
@@ -270,9 +411,16 @@ export class Viewer {
       o.part = p;
       if (o.body) o.body.color.set(p.color || C.body);   // color never needs a rebuild
       this.place(o.group, p.xform);
-      o.group.visible = !p.hidden;
+      o.group.visible = !p.hidden && (!this.soloId || this.soloId === p.id);
     }
-    for (const [id, o] of this.objs) if (!seen.has(id)) { this.drop(o); this.objs.delete(id); }
+    // keep: parts just gone (joined into a group still being built) stay on screen until it is
+    // ready, so nothing blinks out; the app marks them busy meanwhile
+    this.kept = new Set();
+    for (const [id, o] of this.objs) if (!seen.has(id)) {
+      if (keep) { this.kept.add(id); continue; }
+      this.drop(o); this.objs.delete(id);
+    }
+    this.sceneBoxDirty = true;
     this.paintSelection();
     this.request();
   }
@@ -286,20 +434,26 @@ export class Viewer {
     const group = new THREE.Group();
     const hole = !!p.hole;
     // each solid gets its own material so it can carry its own color
+    const cut = this.cutHere(p.id) ? [this.clipPlane] : null;
     const body = hole ? null : new THREE.MeshLambertMaterial({ color: p.color || C.body, flatShading: true, polygonOffset: true,
-      polygonOffsetFactor: 1, polygonOffsetUnits: 1, clippingPlanes: this.clipOn ? [this.clipPlane] : null });
+      polygonOffsetFactor: 1, polygonOffsetUnits: 1, clippingPlanes: cut });
     const mesh = new THREE.Mesh(g, hole ? this.mats.hole : body);
     mesh.userData = { id: p.id, hole };
     group.add(mesh);
-    if (!hole) group.add(new THREE.Mesh(g, this.mats.inside));
-    let edges = null;
-    {
-      edges = new THREE.LineSegments(new THREE.EdgesGeometry(g, 40), hole ? this.mats.holeEdge : this.mats.edge);
-      if (hole) edges.computeLineDistances();
-      group.add(edges);
-    }
+    // the inside of the walls, seen through a cut: the theme's inside color, barely there, so the
+    // part reads as hollow and what is inside it shows (its own, so only parts being cut are cut)
+    const insideMat = hole ? null : this.mats.inside.clone();
+    if (insideMat) { insideMat.clippingPlanes = cut; group.add(new THREE.Mesh(g, insideMat)); }
+    // feature lines: small parts here and now; big ones from the worker, filled in when ready
+    // (building them on the page took 4 s for 1.2 million triangles and froze the view)
+    const small = m.tris.length / 9 <= 30000;
+    const edges = new THREE.LineSegments(small ? new THREE.EdgesGeometry(g, 40) : new THREE.BufferGeometry(), hole ? this.mats.holeEdge : this.mats.edge);
+    if (hole && small) edges.computeLineDistances();
+    group.add(edges);
+    if (!small) queueMicrotask(() => this.onNeedEdges?.(p.id, m.key, m.tris));
+    if (m.tris.length / 9 > 100000) queueMicrotask(() => this.onNeedBvh?.(p.id, m.key, m.tris));
     this.root.add(group);
-    const o = { group, mesh, edges, body, key: m.key, tris: m.tris, hole, part: p };
+    const o = { group, mesh, edges, body, insideMat, key: m.key, tris: m.tris, hole, part: p };
     if (this.faultsOn) this.addFaults(o);
     return o;
   }
@@ -334,7 +488,9 @@ export class Viewer {
 
   drop(o) {
     o.group.traverse(c => { if (c.geometry) c.geometry.dispose(); });
-    o.body?.dispose();
+    o.body?.dispose(); o.insideMat?.dispose();
+    o.seeThrough?.dispose();
+    for (const [id, x] of this.objs) if (x === o) this.insideIds?.delete(id);
     this.root.remove(o.group);
   }
 
@@ -345,12 +501,17 @@ export class Viewer {
     obj.scale.set(...(x?.scale || [1, 1, 1]));
   }
 
-  /** History view: show these parts instead of the live scene, or null to go back.
+  /** History view: show these parts in place of the part ids given (the rest stay as they are,
+   *  unless others is false: then only these show), or null to go back.
    *  items: [{tris, xform, color, hole}] in each part's own frame. */
-  showPast(items) {
+  showPast(items, replace = [], others = true) {
     if (this.past) { this.past.traverse(c => { c.geometry?.dispose(); if (c.material && c.material !== this.mats.hole && c.material !== this.mats.inside) c.material.dispose(); }); this.scene.remove(this.past); this.past = null; }
-    this.root.visible = !items;
+    for (const id of this.pastHidden || []) { const o = this.objs.get(id); if (o) o.group.visible = !o.part?.hidden; }
+    this.pastHidden = null;
+    this.root.visible = !items || others;
     if (items) {
+      this.pastHidden = [...replace];
+      for (const id of replace) { const o = this.objs.get(id); if (o) o.group.visible = false; }
       this.past = new THREE.Group();
       for (const it of items) {
         const g = new THREE.BufferGeometry();
@@ -367,8 +528,39 @@ export class Viewer {
     this.request();
   }
 
+  /** A picking search tree made in the worker for the part's mesh with this key. It sits on its
+   *  own geometry (sharing the points) so the part's drawn geometry is untouched. */
+  setBvh(id, key, data) {
+    const o = this.objs.get(id);
+    if (!o || o.key !== key) return;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', o.mesh.geometry.attributes.position);
+    o.pickBvh = MeshBVH.deserialize(data, g, { setIndex: true });
+    o.pickIndex = data.index;
+  }
+
+  /** Feature lines worked out elsewhere, for the part's mesh with this key (a newer mesh wins). */
+  setEdges(id, key, segs) {
+    const o = this.objs.get(id);
+    if (!o || o.key !== key) return;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(segs, 3));
+    o.edges.geometry.dispose();
+    o.edges.geometry = g;
+    if (o.hole) o.edges.computeLineDistances();
+    this.request();
+  }
+
+  /** Show only this part (the others hidden in the view only), or null for all. */
+  solo(id) {
+    this.soloId = id || null;
+    for (const [oid, o] of this.objs) o.group.visible = !o.part?.hidden && (!this.soloId || oid === this.soloId);
+    this.sceneBoxDirty = true;
+    this.request();
+  }
+
   /** Move a part's display without a rebuild (live drag). */
-  setXform(id, x) { const o = this.objs.get(id); if (o) { this.place(o.group, x); this.request(); } }
+  setXform(id, x) { const o = this.objs.get(id); if (o) { this.place(o.group, x); this.sceneBoxDirty = true; this.request(); } }
 
   /** Placing a new shape: a see-through copy follows the pointer until a click.
    *  onPlace('move' | 'click', hit) with hit = {point, normal} on a part, or {point} on the plate. */
@@ -441,7 +633,9 @@ export class Viewer {
       // selected: lit up (lightness, works on any color) and green outline (shape cue)
       if (o.body) o.body.emissive.setHex(on ? 0x3a3a3a : 0x000000);
       if (o.edges && !o.hole) o.edges.material = on ? this.mats.edgeSel : this.mats.edge;
+      if (on) o.mesh.layers.enable(2); else o.mesh.layers.disable(2);   // layer 2: drawn into the outline mask
     }
+    if (this.clipOn) this.applyClip();   // the cut follows the selection
   }
 
   /** Highlight picked triangles on one part (tool face picks). */
@@ -560,27 +754,93 @@ export class Viewer {
     this.guides.geometry.computeBoundingSphere();
     this.guides.visible = true;
   }
-  /** Inside a part, that part turns see-through until the camera leaves it; the rest stay solid. */
-  updateInside() {
+  /** Inside a part, that part turns see-through until the camera leaves it; the rest stay solid.
+   *  Inside means: the camera is within the part's box and the first surface straight ahead is
+   *  the back of one of its faces. That holds for open imported meshes too, and it is exactly
+   *  when the view would otherwise fill with the part's dark inside color. Its walls then show
+   *  in its own color, see-through, so the other parts and where they cross can be seen.
+   *  Heavy parts are tested at most every 120 ms while the camera moves, and once it stops. */
+  updateInside(force = false) {
     const cam = this.camera.position;
-    let inside = null;
-    for (const [id, o] of this.objs) {
-      if (o.hole || !o.group.visible || !o.body) continue;
-      if (!new THREE.Box3().setFromObject(o.group).containsPoint(cam)) continue;
-      const rc = new THREE.Raycaster(cam.clone(), new THREE.Vector3(0.577, 0.577, 0.577));
-      const exits = rc.intersectObject(o.group.children[1], false).length, entries = rc.intersectObject(o.mesh, false).length;
-      if (exits > entries) { inside = id; break; }
+    const now = performance.now();
+    if (!force && this.insideAt && now - this.insideAt < 120 && this.insideHeavy) {
+      clearTimeout(this.insideTimer);
+      this.insideTimer = setTimeout(() => { this.updateInside(true); this.request(); }, 130);
+      return;
     }
-    if (inside === this.insideId && (!inside || this.objs.get(inside)?.body?.transparent)) return;   // a rebuilt part comes back solid
+    this.insideAt = now;
+    const near = [];
+    let heavy = false;
+    for (const [id, o] of this.objs) {
+      if (o.hole || !o.group.visible || !o.body || !o.group.children[1]) continue;
+      const b = new THREE.Box3().setFromObject(o.mesh);
+      if (!b.expandByScalar(Math.max(0.01, this.camera.near)).containsPoint(cam)) continue;
+      near.push([id, o]);
+      if (o.tris.length > 9 * 200000) heavy = true;
+    }
+    this.insideHeavy = heavy;
+    // each part on its own: the camera may be inside several that overlap, and each turns see-through
+    const inside = new Set();
+    if (near.length) {
+      const dir = this.controls.target.clone().sub(cam);
+      if (dir.lengthSq() < 1e-12) this.camera.getWorldDirection(dir);
+      const rc = new THREE.Raycaster(cam.clone(), dir.normalize());
+      for (const [id, o] of near) {
+        const hits = rc.intersectObjects([o.mesh, o.group.children[1]], false).filter(x => !(this.clipOn && this.clipPlane.distanceToPoint(x.point) < 0));
+        if (hits.length && hits[0].object === o.group.children[1]) inside.add(id);
+      }
+    }
+    const was = this.insideIds || new Set();
+    if (inside.size === was.size && [...inside].every(id => was.has(id))) return;
     const set = (id, on) => {
       const o = this.objs.get(id);
       if (!o?.body) return;
-      o.body.transparent = on; o.body.opacity = on ? 0.25 : 1; o.body.depthWrite = !on; o.body.needsUpdate = true;
-      if (o.group.children[1]) o.group.children[1].visible = !on;
+      const back = o.group.children[1];
+      if (on) {
+        o.seeThrough ||= new THREE.MeshLambertMaterial({ side: THREE.BackSide, transparent: true, opacity: 0.35, depthWrite: false, flatShading: true });
+        o.seeThrough.color.copy(o.body.color);
+        o.seeThrough.clippingPlanes = this.cutHere(id) ? [this.clipPlane] : null;
+        back.material = o.seeThrough;
+      } else back.material = o.insideMat;
     };
-    if (this.insideId) set(this.insideId, false);
-    if (inside) set(inside, true);
-    this.insideId = inside;
+    for (const id of was) if (!inside.has(id)) set(id, false);
+    for (const id of inside) if (!was.has(id)) set(id, true);
+    this.insideIds = inside;
+  }
+
+  // ---- cut view: only the selected parts (all of them when none is selected) ------------------
+  cutHere(id) { return this.clipOn && (!this.selected.size || this.selected.has(id)); }
+  /** Clipping on exactly the parts being cut; a material changing over needs its shader rebuilt. */
+  applyClip() {
+    const plane = [this.clipPlane];
+    const set = (m, on) => { if (!m) return; if (!!m.clippingPlanes !== on) { m.clippingPlanes = on ? plane : null; m.needsUpdate = true; } };
+    const all = this.clipOn && !this.selected.size;
+    for (const [id, o] of this.objs) { const c = this.cutHere(id); set(o.body, c); set(o.insideMat, c); set(o.seeThrough, c); }
+    set(this.mats.edgeSel, this.clipOn);
+    set(this.mats.edge, all);
+    set(this.mats.hole, all);
+    set(this.mats.holeEdge, all);
+    set(this.mats.pick, this.clipOn);
+    set(this.mats.bodySel, this.clipOn);
+  }
+
+  // ---- busy: parts being rebuilt are striped and cannot be picked ------------------------------
+  setBusy(ids) {
+    this.busy = new Set(ids);
+    if (!this.busyMat) {
+      this.busyMat = new THREE.ShaderMaterial({
+        uniforms: { color: { value: new THREE.Color(0xb0b0b0) } },
+        vertexShader: 'void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+        fragmentShader: 'uniform vec3 color; void main() { if (mod(gl_FragCoord.x + gl_FragCoord.y, 12.0) > 4.0) discard; gl_FragColor = vec4(color, 1.0);\n#include <colorspace_fragment>\n}',
+        polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2,
+      });
+    }
+    for (const [id, o] of this.objs) {
+      const on = this.busy.has(id);
+      if (on && !o.busyMesh) { o.busyMesh = new THREE.Mesh(o.mesh.geometry, this.busyMat); o.group.add(o.busyMesh); }
+      else if (!on && o.busyMesh) { o.group.remove(o.busyMesh); o.busyMesh = null; }
+    }
+    this.request();
   }
 
   /** Accent colors for a scheme: selection edges, picks and the inside of a cut. */
@@ -590,8 +850,55 @@ export class Viewer {
     for (const [k, m] of Object.entries(this.mats)) {
       if (!m?.color) continue;
       if (k === 'guide') m.color.setHex(s[2]);
-      else if (k === 'inside') m.color.setHex(s[1]);
+      else if (k === 'inside') { m.color.setHex(s[1]); for (const o of this.objs.values()) o.insideMat?.color.setHex(s[1]); }
       else if (/sel|pick|box|handle/i.test(k)) m.color.setHex(s[0]);
+    }
+    this.outlineMat.uniforms.color.value.setHex(s[0]);
+    this.request();
+  }
+
+  /** Theme colors for the view (hex strings), from the theme builder. Any left out keep theirs. */
+  setViewColors(c) {
+    if (c.bg) { this.bgColor = new THREE.Color(c.bg).getHex(); if (!this.bgImage) this.renderer.setClearColor(this.bgColor, 1); }
+    if (c.select) { this.mats.edgeSel.color.set(c.select); this.mats.pick.color.set(c.select); this.outlineMat.uniforms.color.value.set(c.select); this.hot.color.set(c.select); }
+    if (c.inside) { this.mats.inside.color.set(c.inside); for (const o of this.objs.values()) o.insideMat?.color.set(c.inside); }
+    if (c.guide) { this.guideColor = new THREE.Color(c.guide).getHex(); this.mats.guide?.color.set(c.guide); }
+    if (c.plate || c.grid || c.gridMajor) {
+      this.plateColors = { ...this.plateColors, ...Object.fromEntries(['plate', 'grid', 'gridMajor'].filter(k => c[k]).map(k => [k, c[k]])) };
+      if (this.plateSpec) this.setPlate(this.plateSpec);
+    }
+    this.request();
+  }
+
+  /** A picture behind the view (the page shows it; the view clears to see-through), or off. */
+  setBackdrop(on) {
+    this.bgImage = !!on;
+    this.renderer.setClearColor(this.bgColor, on ? 0 : 1);
+    // the plate's dark fill would hide the picture: only its lines stay
+    if (this.plate) this.plate.children[0].visible = !on;
+    this.request();
+  }
+
+  /** A picture lying on the plate under the grid, to model over: {image (a canvas: an
+   *  ImageBitmap would ignore flipY and land upside down), w, d, x, y, rot, opacity, mirrorX, mirrorY}, or null. */
+  setPlateImage(img) {
+    if (this.plateImg) { this.scene.remove(this.plateImg); this.plateImg.geometry.dispose(); this.plateImg.material.dispose(); this.plateImg = null; }
+    if (this.plateTex && this.plateTex.image !== img?.image) { this.plateTex.dispose(); this.plateTex = null; }
+    if (img) {
+      if (!this.plateTex) {
+        this.plateTex = new THREE.Texture(img.image);
+        this.plateTex.colorSpace = THREE.SRGBColorSpace;
+        this.plateTex.flipY = true;
+        this.plateTex.needsUpdate = true;
+      }
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map: this.plateTex, transparent: true, opacity: img.opacity ?? 1, depthWrite: false, side: THREE.DoubleSide }));
+      // the picture reads as it does on screen when seen from above; the mirror switches flip it
+      m.scale.set(img.w * (img.mirrorX ? -1 : 1), img.d * (img.mirrorY ? -1 : 1), 1);
+      m.position.set(img.x || 0, img.y || 0, -0.005);
+      m.rotation.z = ((img.rot || 0) * Math.PI) / 180;
+      m.renderOrder = -1;
+      this.plateImg = m;
+      this.scene.add(m);
     }
     this.request();
   }
@@ -711,7 +1018,10 @@ export class Viewer {
     }
     const hw = w / 2, hd = d / 2, p = [], c = [], pM = [], cM = [];
     this.plateHalf = [hw, hd];
-    const minor = new THREE.Color(C.grid), major = new THREE.Color(C.gridMajor);
+    this.plateSpec = { w, d, every };
+    this.sceneBoxDirty = true;
+    const pc = { plate: C.plate, grid: C.grid, gridMajor: C.gridMajor, ...this.plateColors };
+    const minor = new THREE.Color(pc.grid), major = new THREE.Color(pc.gridMajor);
     const big = every < 10 ? 10 : every * 5;   // heavy lines every 10 mm whenever the spacing allows
     const onBig = v => Math.abs(v / big - Math.round(v / big)) < 1e-6;
     const line = (k, ...xyz) => { const [pp, cc] = k === major ? [pM, cM] : [p, c]; pp.push(...xyz); cc.push(k.r, k.g, k.b, k.r, k.g, k.b); };
@@ -728,7 +1038,7 @@ export class Viewer {
     gM.setAttribute('color', new THREE.Float32BufferAttribute(cM, 3));
     const majorLines = new THREE.LineSegments(gM, new THREE.LineBasicMaterial({ vertexColors: true }));
     this.minorLines = lines;
-    const plate = new THREE.Mesh(new THREE.PlaneGeometry(w, d), new THREE.MeshBasicMaterial({ color: C.plate, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 }));
+    const plate = new THREE.Mesh(new THREE.PlaneGeometry(w, d), new THREE.MeshBasicMaterial({ color: pc.plate, polygonOffset: true, polygonOffsetFactor: 2, polygonOffsetUnits: 2 }));
     plate.position.z = -0.01;
     // fine lines: 0.1 mm over a 200 x 200 mm patch in the middle, whatever the plate size, shown
     // only when zoomed in close (fixed size, so a wide screen costs no more)
@@ -743,24 +1053,44 @@ export class Viewer {
     this.plate = new THREE.Group();
     this.plate.add(plate, this.fine, lines, majorLines);
     this.plate.visible = this.gridOn !== false;
+    plate.visible = !this.bgImage;
     this.scene.add(this.plate);
     this.request();
   }
 
-  setClip(axis, t) { this.clipAxis = axis; this.clipT = t; this.updateClip(); this.request(); }
+  /** Cut along an axis at a position in mm (world), or axis null for no cut. */
+  setClip(axis, at) { this.clipAxis = axis; this.clipAt = at; this.updateClip(); this.request(); }
+  /** The extent of what the cut works on, along an axis: [lo, hi] mm, or null. */
+  cutRange(axis) {
+    const b = this.bounds(this.selected.size ? [...this.selected] : null);
+    if (!b) return null;
+    const i = { x: 0, y: 1, z: 2 }[axis];
+    return [b.min.getComponent(i), b.max.getComponent(i)];
+  }
   updateClip() {
-    const b = this.bounds();
-    const on = !!this.clipAxis && !!b;
+    const on = !!this.clipAxis && this.objs.size > 0;
     if (on !== this.clipOn) {
       this.clipOn = on;
-      for (const m of [...Object.values(this.mats), ...[...this.objs.values()].map(o => o.body).filter(Boolean)]) m.clippingPlanes = on ? [this.clipPlane] : null;
+      this.applyClip();
     }
     if (!on) return;
     const i = { x: 0, y: 1, z: 2 }[this.clipAxis];
-    const lo = b.min.getComponent(i), hi = b.max.getComponent(i);
+    // the half nearer the camera goes, so the cut face looks at you
     const s = this.camera.position.getComponent(i) >= this.controls.target.getComponent(i) ? 1 : -1;
     const n = new THREE.Vector3(); n.setComponent(i, -s);
-    this.clipPlane.set(n, s * (lo + (hi - lo) * this.clipT));
+    this.clipPlane.set(n, s * this.clipAt);
+  }
+
+  /** The plate in the middle of the view, all of it in sight, looking the way the view looks now. */
+  viewPlate() {
+    const [hw, hd] = this.plateHalf || [300, 300];
+    const v = this.camera.position.clone().sub(this.controls.target).normalize();
+    const r = Math.hypot(hw, hd);
+    const d = (r / Math.sin((this.camera.fov * Math.PI) / 360)) * 1.05;
+    this.controls.target.set(0, 0, 0);
+    this.camera.position.copy(v.multiplyScalar(d));
+    this.controls.update();
+    this.request();
   }
 
   /** kind: iso | top | front | right; ids: fit these (default all, or the plate). */
@@ -769,13 +1099,10 @@ export class Viewer {
     const c = b.getCenter(new THREE.Vector3());
     const r = Math.max(5, b.getSize(new THREE.Vector3()).length() / 2);
     const d = (r / Math.sin((this.camera.fov * Math.PI) / 360)) * 1.1;
-    const dir = { iso: [0.55, -0.75, 0.55], top: [0, -0.0001, 1], front: [0, -1, 0.0001], left: [-1, 0, 0.0001], right: [1, 0, 0.0001] }[kind] || null;
+    const dir = { iso: [0.55, -0.75, 0.55], top: [0, -0.0001, 1], bottom: [0, -0.0001, -1], front: [0, -1, 0.0001], left: [-1, 0, 0.0001], right: [1, 0, 0.0001] }[kind] || null;
     const v = dir ? new THREE.Vector3(...dir).normalize() : this.camera.position.clone().sub(this.controls.target).normalize();
     this.controls.target.copy(c);
     this.camera.position.copy(c).addScaledVector(v, d);
-    this.camera.near = Math.max(0.05, d / 2000);
-    this.camera.far = d * 40;
-    this.camera.updateProjectionMatrix();
     this.controls.update();
     this.request();
   }

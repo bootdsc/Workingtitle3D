@@ -3,6 +3,10 @@
 import { run } from '../src/tools/hollower/compute.js';
 import { repair, report, describe } from '../src/core/meshcheck.js';
 import { box, sphere, extrude, rect, circle } from './shapes.mjs';
+import { readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { initKernel } from '../src/core/kernel.js';
+await initKernel(readFileSync(createRequire(import.meta.url).resolve('manifold-3d/manifold.wasm')));   // openings are cut by the solid engine
 
 /** Triangles of the planar region facing `normal` at the extreme along it. */
 function faceAt(tris, normal) {
@@ -27,16 +31,19 @@ const cases = [
   ['box open side', box(0, 0, 0, 40, 30, 20), { wall: 1.5, voxel: 0.5 }, [1, 0, 0], 40 * 30 * 20 - 38.5 * 27 * 17],
   ['sphere closed', sphere(20, 64, 32), { wall: 2, voxel: 0.5 }, null, null],
   ['plate+holes open top', extrude(rect(0, 0, 60, 30), [circle(15, 15, 6), rect(35, 8, 50, 22)], 0, 12), { wall: 1.6, voxel: 0.4 }, [0, 0, 1], null],
+  ['box open both ends', box(0, 0, 0, 40, 30, 20), { wall: 2, voxel: 0.5 }, [[1, 0, 0], [-1, 0, 0]], 40 * 30 * 20 - 40 * 26 * 16],
+  ['box open top, both ends', box(0, 0, 0, 40, 30, 20), { wall: 2, voxel: 0.5 }, [[0, 0, 1], [1, 0, 0], [-1, 0, 0]], 40 * 30 * 20 - 40 * 26 * 18],
   ['thin plate', box(0, 0, 0, 40, 30, 3), { wall: 2, voxel: 0.5 }, null, 'error'],
 ];
 let fail = 0;
 for (const [name, raw, p, open, expect] of cases) {
   const { tris } = repair(raw);
   const r0 = report(tris);
-  const selection = open ? faceAt(tris, open) : [];
+  // one face, or several (each an opening)
+  const selection = !open ? [] : Array.isArray(open[0]) ? open.map(nm => faceAt(tris, nm)) : faceAt(tris, open);
   const t0 = performance.now();
   try {
-    const out = await run(tris.slice(), { ...p, open: !!open }, { selection, progress() {} });
+    const out = await run(tris.slice(), p, { selection, progress() {} });
     const r = report(out.tris);
     let ok = r.watertight && r.volume < r0.volume && expect !== 'error';
     let vol = '';

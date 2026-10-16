@@ -239,7 +239,8 @@ export async function local(part, ctx) {
       shape = { man: m, soup: null };
     }
     tris = shapeTris(shape);
-    const sel = op.sel?.segs ? op.sel : resolveFace(tris, op.sel);   // picked edges travel as plan segments
+    // picked edges travel as plan segments; several picked faces as a list, each found again here
+    const sel = op.sel?.segs ? op.sel : op.sel?.faces ? op.sel.faces.map(s => resolveFace(tris, s)) : resolveFace(tris, op.sel);
     const out = await tool.run(tris, op.params, { selection: sel, progress: ctx.progress || (() => {}), kernel: { M, toManifold, toTris } });
     if (out.notes) for (const t of out.notes) note(t);
     freeShape(shape);
@@ -381,6 +382,45 @@ export async function flatten(parts, ctx, opts = {}) {
   if (joined !== all) joined.delete();
   for (const m of owned) m.delete();
   return loose.length ? concat([tris, ...loose]) : tris;
+}
+
+/** Split a part at a plane across one axis (0 x, 1 y, 2 z) at `at` mm, in world space. Both
+ *  halves come back closed (the cut face is filled), as world triangles; a half the plane
+ *  misses is null. An open mesh is closed first, as for any step that needs a solid. */
+export async function splitPart(part, ctx, axis, at) {
+  const base = await local(part, ctx);
+  let man = base.man, owned = null;
+  if (!man && base.soup) man = owned = closeSoup(base.soup, part.name, ctx);
+  if (!man) throw new ToolError(`${part.name || 'The part'} has nothing to cut.`);
+  const placed = place(man, part.xform);
+  const n = [0, 0, 0]; n[axis] = 1;
+  const [above, below] = placed.splitByPlane(n, at);
+  const out = { a: below.isEmpty() ? null : toTris(below), b: above.isEmpty() ? null : toTris(above) };
+  above.delete(); below.delete();
+  if (placed !== man) placed.delete();
+  owned?.delete();
+  return out;
+}
+
+/** Flat outlines (rings of [x, y] in mm; even-odd: a ring inside another is a hole) pushed
+ *  up by height mm from z = 0, as a closed solid's triangles. */
+export function extrudeRings(rings, height) {
+  if (!(height > 0)) throw new ToolError('The height must be above zero.');
+  rings = rings.filter(r => r.length >= 3);
+  if (!rings.length) throw new ToolError('Nothing to extrude: no outline encloses any area.');
+  const raw = new M.CrossSection(rings, 'EvenOdd');
+  // outlines that touch only at a corner would make an edge shared by four faces: grow by
+  // 0.01 mm (square corners) and shrink back (round corners), which joins them there with a
+  // neck about 0.008 mm wide; inside corners elsewhere get a 0.01 mm round, under 0.005 mm off
+  const grown = raw.offset(0.01, 'Miter', 4);
+  const cs = grown.offset(-0.01, 'Round', 4, 8);
+  raw.delete(); grown.delete();
+  if (cs.isEmpty()) { cs.delete(); throw new ToolError('Nothing to extrude: no outline encloses any area.'); }
+  const man = M.Manifold.extrude(cs, height);
+  cs.delete();
+  const tris = toTris(man);
+  man.delete();
+  return tris;
 }
 
 function concat(list) {

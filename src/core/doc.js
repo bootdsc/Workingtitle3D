@@ -13,6 +13,11 @@ export function shapeKey(p) {
   }
   return p.kind + JSON.stringify(p.params || {}) + (p.blob || '') + JSON.stringify(p.ops || []);
 }
+/** What makes a part's form: its shape, turn, scale and solid or hole. Not where it sits,
+ *  its name, color, or whether it is hidden or locked. A part's history is its forms. */
+export function formKey(p) {
+  return shapeKey(p) + '|' + JSON.stringify(p.xform?.rot || []) + JSON.stringify(p.xform?.scale || []) + (p.hole ? 'h' : 's');
+}
 /** Top-level parts after one command, run forward (dir 1) or back (dir -1). */
 function applyCmd(list, cmd, dir) {
   const parts = dir > 0 ? cmd.after : cmd.before;
@@ -84,7 +89,7 @@ export class Doc {
 
   // ---- commands ------------------------------------------------------------------------------
   /** Run fn(parts) on a working copy; record what changed at the top level as one step. */
-  commit(label, fn) {
+  commit(label, fn, extra = null) {
     const beforeList = this.parts;
     const work = clone(this.parts);
     const ret = fn(work);
@@ -98,7 +103,7 @@ export class Doc {
     }
     const beforeOrder = beforeList.map(p => p.id), afterOrder = work.map(p => p.id);
     if (!touched.length && beforeOrder.join() === afterOrder.join()) return ret;
-    const cmd = { t: Date.now(), label, touched, before, after, beforeOrder, afterOrder };
+    const cmd = { t: Date.now(), label, touched, before, after, beforeOrder, afterOrder, ...extra };
     this.history.length = this.at;           // a new step drops the redo branch
     this.history.push(cmd);
     this.at++;
@@ -112,14 +117,21 @@ export class Doc {
   /** Every part id inside a part, itself included. */
   idsIn(part) { return [part.id, ...(part.children || []).flatMap(c => this.idsIn(c))]; }
 
-  /** The steps (1-based counts into history) at which this part, or anything now inside
-   *  it, changed - so a group's timeline shows its pieces being made and put together. */
-  timeline(id) {
-    const p = this.top(id);
-    if (!p) return [];
-    const ids = new Set(this.idsIn(p));
+  /** A part's history: each form it has had, oldest first, as [{step (1-based into history),
+   *  label, state}]. Moving it is not a new form; nor is a roll back through this history,
+   *  so stepping back and forth keeps the same list. */
+  formHistory(id) {
     const out = [];
-    for (let i = 0; i < this.at; i++) if (this.history[i].touched.some(t => ids.has(t))) out.push(i + 1);
+    let cur = null;
+    for (let i = 0; i < this.at; i++) {
+      const c = this.history[i];
+      if (!c.touched.includes(id)) continue;
+      const s = c.after[id];
+      if (!s) { cur = null; continue; }
+      const k = formKey(s);
+      if (k !== cur && c.kind !== 'rollback') out.push({ step: i + 1, label: c.label, state: s, key: k });
+      cur = k;
+    }
     return out;
   }
 

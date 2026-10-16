@@ -13,6 +13,7 @@
     "earcut": "3.2.3",
     "esbuild": "0.25.10",
     "manifold-3d": "3.5.4",
+    "occt-import-js": "0.0.23",
     "three": "0.186.1",
     "three-mesh-bvh": "0.9.15"
   }

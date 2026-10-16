@@ -16,7 +16,7 @@ function toolIds() {
   return fs.readdirSync(dir).filter(d => fs.existsSync(path.join(dir, d, 'index.js'))).sort();
 }
 
-function virtuals(workerSource) {
+function virtuals(workerSource, cadSource = '') {
   return {
     name: 'virtuals',
     setup(b) {
@@ -35,6 +35,9 @@ function virtuals(workerSource) {
         if (a.path === 'virtual:worker-src') {
           return { contents: `export default ${JSON.stringify(workerSource)};`, resolveDir: src };
         }
+        if (a.path === 'virtual:cad-src') {
+          return { contents: `export default ${JSON.stringify(cadSource)};`, resolveDir: src };
+        }
       });
     },
   };
@@ -48,7 +51,11 @@ async function build() {
   const t0 = Date.now();
   const w = await esbuild.build({ ...common, entryPoints: [path.join(src, 'core', 'worker.js')], plugins: [virtuals('')] });
   const workerSource = w.outputFiles[0].text;
-  const m = await esbuild.build({ ...common, entryPoints: [path.join(src, 'core', 'main.js')], plugins: [virtuals(workerSource)] });
+  // the STEP worker: the CAD reader's Node-only branches (fs, path) are never taken in a page
+  const c = await esbuild.build({ ...common, entryPoints: [path.join(src, 'core', 'cadworker.js')], plugins: [virtuals('')],
+    external: [...common.external, 'fs', 'path', 'crypto', 'url', 'worker_threads', 'child_process'] });
+  const cadSource = c.outputFiles[0].text;
+  const m = await esbuild.build({ ...common, entryPoints: [path.join(src, 'core', 'main.js')], plugins: [virtuals(workerSource, cadSource)] });
   const js = m.outputFiles[0].text.replace(/<\/script/gi, '<\\/script');
   const css = fs.readFileSync(path.join(src, 'core', 'theme.css'), 'utf8');
   // the licences travel inside the one file: ours, and every bundled library's (their terms ask for it)

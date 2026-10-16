@@ -333,6 +333,7 @@ try {
     await menuItem('File', 'Export...');
     await page.waitForSelector('dialog[open]');
     await click('dialog[open] .seg button', f);
+    await click('dialog[open] .seg button', 'All');   // a part is selected: the dialog starts on Selected
     await click('dialog[open] .btn', 'Export');
     const es = await waitStatus(/Exported|ERROR/, 120000);
     const file = await download('model.' + f.toLowerCase());

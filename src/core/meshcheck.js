@@ -4,6 +4,23 @@ import { triangulate } from './tri2d.js';
 
 export const WELD = 1e-4; // mm
 
+/** A Map for numeric keys split over 64: one Map holds at most about 16.7 million entries, and a
+ *  big model (or a fine hollow) has more edges than that. Same calls as a Map, as used here. */
+export class BigMap {
+  constructor() { this.m = Array.from({ length: 64 }, () => new Map()); }
+  part(k) { return this.m[((k % 64) + 64) % 64 | 0]; }
+  get(k) { return this.part(k).get(k); }
+  set(k, v) { this.part(k).set(k, v); return this; }
+  has(k) { return this.part(k).has(k); }
+  delete(k) { return this.part(k).delete(k); }
+  clear() { for (const x of this.m) x.clear(); }
+  get size() { return this.m.reduce((s, x) => s + x.size, 0); }
+  *entries() { for (const x of this.m) yield* x.entries(); }
+  *values() { for (const x of this.m) yield* x.values(); }
+  *keys() { for (const x of this.m) yield* x.keys(); }
+  [Symbol.iterator]() { return this.entries(); }
+}
+
 /** Weld coincident vertices on a WELD grid. Returns positions and a 3-per-triangle index.
  *  An open-addressing table of grid cells: no strings, a few typed arrays. */
 export function weld(tris, tol = WELD) {
@@ -67,31 +84,84 @@ export function report(tris, tol = WELD) {
   const n = tris.length / 9;
   if (!n) return { triangles: 0, openEdges: 0, oversharedEdges: 0, flippedEdges: 0, volume: 0, watertight: false, overEdges: [] };
   const { pos, idx, nv } = weld(tris, tol);
-  const und = new Map(), dir = new Map();
+  // every edge as a number, both ways round (und) and as it runs (dir); sorted, equal edges sit
+  // together and are counted in one pass (typed arrays: a fraction of the time and memory of maps)
+  const und = new Float64Array(n * 3), dir = new Float64Array(n * 3);
+  let m = 0;
   for (let t = 0; t < n; t++) {
     const a = idx[t * 3], b = idx[t * 3 + 1], c = idx[t * 3 + 2];
     if (a === b || b === c || a === c) continue;
-    for (const [p, q] of [[a, b], [b, c], [c, a]]) {
-      const u = p < q ? p * nv + q : q * nv + p;
-      und.set(u, (und.get(u) || 0) + 1);
-      const d = p * nv + q;
-      dir.set(d, (dir.get(d) || 0) + 1);
+    for (let e = 0; e < 3; e++) {
+      const p = e === 0 ? a : e === 1 ? b : c, q = e === 0 ? b : e === 1 ? c : a;
+      und[m] = p < q ? p * nv + q : q * nv + p;
+      dir[m++] = p * nv + q;
     }
   }
+  const U = und.subarray(0, m).sort(), D = dir.subarray(0, m).sort();
   let open = 0, over = 0, flip = 0;
   const overEdges = [];   // [x1, y1, z1, x2, y2, z2] of each over-shared edge: where pieces only touch
-  for (const [u, c] of und) {
+  for (let i = 0; i < m;) {
+    let j = i + 1;
+    while (j < m && U[j] === U[i]) j++;
+    const c = j - i;
     if (c === 1) open++;
     else if (c > 2) {
       over++;
-      const p = Math.floor(u / nv), q = u % nv;
+      const p = Math.floor(U[i] / nv), q = U[i] % nv;
       if (overEdges.length < 20000) overEdges.push([pos[p * 3], pos[p * 3 + 1], pos[p * 3 + 2], pos[q * 3], pos[q * 3 + 1], pos[q * 3 + 2]]);
     }
+    i = j;
   }
-  for (const c of dir.values()) if (c > 1) flip++;
+  for (let i = 0; i < m;) {
+    let j = i + 1;
+    while (j < m && D[j] === D[i]) j++;
+    if (j - i > 1) flip++;
+    i = j;
+  }
   const vol = volume(tris);
   return { triangles: n, openEdges: open, oversharedEdges: over, flippedEdges: flip, volume: vol,
     watertight: open === 0 && over === 0 && flip === 0 && vol > 0, overEdges };
+}
+
+/** Feature lines: every edge where the two faces meet at more than `angle` degrees, and every
+ *  open edge, as segments (6 numbers each). Typed arrays and one sort, for the worker: the
+ *  view's own version took 4 s on the page for 1.2 million triangles. */
+export function featureEdges(tris, angle = 40) {
+  const n = tris.length / 9;
+  const { pos, idx, nv } = weld(tris);
+  const N = new Float32Array(n * 3);
+  for (let f = 0; f < n; f++) {
+    const a = idx[f * 3] * 3, b = idx[f * 3 + 1] * 3, c = idx[f * 3 + 2] * 3;
+    const ux = pos[b] - pos[a], uy = pos[b + 1] - pos[a + 1], uz = pos[b + 2] - pos[a + 2];
+    const vx = pos[c] - pos[a], vy = pos[c + 1] - pos[a + 1], vz = pos[c + 2] - pos[a + 2];
+    let x = uy * vz - uz * vy, y = uz * vx - ux * vz, z = ux * vy - uy * vx;
+    const l = Math.hypot(x, y, z) || 1;
+    N[f * 3] = x / l; N[f * 3 + 1] = y / l; N[f * 3 + 2] = z / l;
+  }
+  // edges sorted by key; the face of each edge kept alongside
+  const m = n * 3, K = new Float64Array(m), order = new Uint32Array(m);
+  for (let i = 0; i < m; i++) {
+    const p = idx[i], q = idx[i - i % 3 + (i % 3 + 1) % 3];
+    K[i] = p < q ? p * nv + q : q * nv + p;
+    order[i] = i;
+  }
+  order.sort((x, y) => K[x] - K[y]);
+  const cos = Math.cos((angle * Math.PI) / 180);
+  const out = [];
+  const seg = i => { const p = idx[i], q = idx[i - i % 3 + (i % 3 + 1) % 3]; out.push(pos[p * 3], pos[p * 3 + 1], pos[p * 3 + 2], pos[q * 3], pos[q * 3 + 1], pos[q * 3 + 2]); };
+  for (let s = 0; s < m;) {
+    let e = s + 1;
+    while (e < m && K[order[e]] === K[order[s]]) e++;
+    const i0 = order[s];
+    if (idx[i0] !== idx[i0 - i0 % 3 + (i0 % 3 + 1) % 3]) {
+      if (e - s === 2) {
+        const f = (order[s] / 3) | 0, g = (order[s + 1] / 3) | 0;
+        if (N[f * 3] * N[g * 3] + N[f * 3 + 1] * N[g * 3 + 1] + N[f * 3 + 2] * N[g * 3 + 2] <= cos) seg(i0);
+      } else seg(i0);   // open or over-shared: always drawn
+    }
+    s = e;
+  }
+  return Float32Array.from(out);
 }
 
 /** Where a mesh is not closed: every open, over-shared or wrongly turned edge as a segment
@@ -99,7 +169,7 @@ export function report(tris, tol = WELD) {
 export function faultEdges(tris, tol = WELD) {
   const n = tris.length / 9;
   const { pos, idx, nv } = weld(tris, tol);
-  const und = new Map(), dir = new Map();
+  const und = new BigMap(), dir = new BigMap();
   for (let t = 0; t < n; t++) {
     const a = idx[t * 3], b = idx[t * 3 + 1], c = idx[t * 3 + 2];
     if (a === b || b === c || a === c) continue;
@@ -140,10 +210,16 @@ export function repair(tris, tol = WELD, opts = {}) {
   const maxHole = opts.maxHole ?? 0;     // mm of rim: bigger holes are left open; 0 = fill all
   const before = report(tris, tol);
   const n = tris.length / 9;
+  // already a closed solid, the right way out: nothing to mend, so nothing is done (a clean
+  // 800k-triangle model went from 9 s to the one check)
+  if (before.watertight && before.volume > 0 && !opts.always) {
+    return { tris, fixes: { welded: 0, degenerate: 0, duplicates: 0, tjunctions: 0, holes: 0, holesLeft: 0, reoriented: 0, flipped: false, before, after: before } };
+  }
   let best = clean(tris, tol);
   // Gaps a little wider than the weld grid: try coarser welds up to the gap size, keep
-  // whichever leaves fewest open edges.
-  const tries = [1e-3, 1e-2, 0.03, 0.1, 0.3, 1].filter(t => t > tol && t <= gap);
+  // whichever leaves fewest open edges. A quick repair (big imports) tries only the first; the
+  // Repair tool does the full search.
+  const tries = [1e-3, 1e-2, 0.03, 0.1, 0.3, 1].filter(t => t > tol && t <= gap).slice(0, opts.quick ? 1 : 99);
   if (gap > tol && !tries.includes(gap)) tries.push(gap);
   for (const t of tries) {
     if (!openCount(best.faces, best.pos.length / 3)) break;
@@ -209,7 +285,7 @@ function clean(tris, tol) {
 
 /** Undirected edge -> list of face-edge slots (face * 3 + corner). */
 function edgeMap(faces, nv) {
-  const m = new Map();
+  const m = new BigMap();
   for (let i = 0; i < faces.length; i++) {
     const p = faces[i], q = faces[i - i % 3 + (i % 3 + 1) % 3];
     const u = p < q ? p * nv + q : q * nv + p;
@@ -430,7 +506,7 @@ export function flipAll(tris) {
 export function adjacency(tris, tol = WELD) {
   const n = tris.length / 9;
   const { idx, nv } = weld(tris, tol);
-  const first = new Map(), count = new Map();
+  const first = new BigMap(), count = new BigMap();
   const adj = new Int32Array(n * 3).fill(-1);
   for (let t = 0; t < n; t++) {
     for (let e = 0; e < 3; e++) {
@@ -473,7 +549,7 @@ export class ToolError extends Error {}
 export function shells(tris, tol = WELD) {
   const n = tris.length / 9;
   const { pos, idx, nv } = weld(tris, tol);
-  const em = new Map();
+  const em = new BigMap();
   for (let i = 0; i < n * 3; i++) {
     const p = idx[i], q = idx[i - i % 3 + (i % 3 + 1) % 3];
     if (p === q) continue;

@@ -15,7 +15,7 @@
 // keeps its line.
 import * as THREE from 'three';
 import { MeshBVH } from 'three-mesh-bvh';
-import { weld } from './meshcheck.js';
+import { weld, BigMap } from './meshcheck.js';
 
 /**
  * tris: Float32Array soup. opts: { target: triangle count to stop at, tol: mm (0 = no limit),
@@ -81,7 +81,7 @@ export function decimate(tris, opts = {}) {
     addPlane(a, nx, ny, nz, d); addPlane(b, nx, ny, nz, d); addPlane(c, nx, ny, nz, d);
   }
   // open edges: a plane through the edge, at right angles to its face
-  const edgeCount = new Map();
+  const edgeCount = new BigMap();
   const ek = (p, q) => (p < q ? p * nv + q : q * nv + p);
   for (let f = 0; f < nf; f++) for (let k = 0; k < 3; k++) {
     const u = ek(F[f * 3 + k], F[f * 3 + (k + 1) % 3]);
