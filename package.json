@@ -1,7 +1,7 @@
 {
   "name": "workingtitle3d",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Offline browser 3D toolset. Core viewer plus tool plugins.",
   "license": "AGPL-3.0-or-later",
   "type": "module",
