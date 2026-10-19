@@ -495,7 +495,7 @@ export class Viewer {
       o.part = p;
       if (o.body) o.body.color.set(p.color || C.body);   // color never needs a rebuild
       this.place(o.group, p.xform);
-      o.group.visible = !p.hidden && (!this.soloId || this.soloId.has(p.id));
+      o.group.visible = !p.hidden && (!this.soloId || this.soloId.has(p.id)) && !this.peekOff.has(p.id);
     }
     // keep: parts just gone (joined into a group still being built) stay on screen until it is
     // ready, so nothing blinks out; the app marks them busy meanwhile
@@ -641,7 +641,7 @@ export class Viewer {
   solo(id) {
     // one part, or several (an array): only they show
     this.soloId = id?.length && typeof id !== 'string' ? new Set(id) : id ? new Set([id]) : null;
-    for (const [oid, o] of this.objs) o.group.visible = !o.part?.hidden && (!this.soloId || this.soloId.has(oid));
+    for (const [oid, o] of this.objs) o.group.visible = !o.part?.hidden && (!this.soloId || this.soloId.has(oid)) && !this.peekOff.has(oid);
     this.sceneBoxDirty = true;
     this.request();
   }
@@ -660,6 +660,37 @@ export class Viewer {
     this.ghost.visible = false;
     this.scene.add(this.ghost);
     this.request();
+  }
+  /** A mesh shown as it is, in world coordinates, not a part (text being wrapped). null takes it away. */
+  setPreview(tris, cut = false) {
+    // a cut (deboss) shows as dark letters seen through the surface, the color of cut walls
+    if (tris && this.wrapMesh && this.wrapMesh.userData.cut !== cut) this.setPreview(null);
+    const o = this.wrapMesh;
+    if (!tris) {
+      if (o) { this.scene.remove(o); o.geometry.dispose(); o.material.dispose(); this.wrapMesh = null; this.request(); }
+      return;
+    }
+    if (!o) {
+      // a cut: only its inside faces (floor and walls as seen into a hole), drawn last over a
+      // cleared depth so the part's surface does not hide them: it reads as letters cut in
+      this.wrapMesh = new THREE.Mesh(new THREE.BufferGeometry(), cut
+        ? new THREE.MeshLambertMaterial({ color: C.inside, flatShading: true, transparent: true, opacity: 1, side: THREE.BackSide })
+        : new THREE.MeshLambertMaterial({ color: C.bodySel, flatShading: true }));
+      this.wrapMesh.userData.cut = cut;
+      if (cut) { this.wrapMesh.renderOrder = 10; this.wrapMesh.onBeforeRender = r => r.clearDepth(); }
+      this.scene.add(this.wrapMesh);
+    }
+    const g = this.wrapMesh.geometry;
+    g.setAttribute('position', new THREE.BufferAttribute(tris, 3));
+    g.computeBoundingSphere();
+    this.request();
+  }
+  /** Show or hide one part's mesh for a while, without changing the part (kept through redraws). */
+  peekOff = new Set();
+  peek(id, on) {
+    if (on) this.peekOff.delete(id); else this.peekOff.add(id);
+    const o = this.objs.get(id);
+    if (o) { o.group.visible = on && !o.part?.hidden && (!this.soloId || this.soloId.has(id)); this.request(); }
   }
   setGhost(x) { if (!this.ghost) return; this.place(this.ghost, x); this.ghost.visible = true; this.request(); }
   endPlace() {

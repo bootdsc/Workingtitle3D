@@ -12,6 +12,7 @@ import { Matrix4, Euler, Quaternion, Vector3 } from 'three';
 import { weld, report, volume, flipAll, repair, bounds, WELD, ToolError } from './meshcheck.js';
 import { solidify } from './solidify.js';
 import { decimate } from './decimate.js';
+import { textRings } from './text.js';
 
 let M = null, starting = null;
 export async function initKernel(wasmBinary) {
@@ -63,6 +64,7 @@ export const SHAPES = {
   wedge: { x: 20, y: 20, z: 20 },
   tube: { d: 20, wall: 2, h: 20, sides: 64 },
   fillet: { r: 5, length: 20, sides: 64 },
+  text: { text: 'Text', size: 10, width: 1.7, spacing: 0.8, lineGap: 2.5, h: 2, sx: 100, sy: 100, vertical: false },
 };
 
 function primitive(kind, p) {
@@ -119,6 +121,34 @@ function primitive(kind, p) {
       for (const x of pieces) x.delete();
       const m = Manifold.extrude(cs, pos(p.h));
       cs.delete();
+      return m;
+    }
+    case 'text': {
+      // the app's own letters, flat on z = 0, pushed up h
+      pos(p.size); pos(p.width); pos(p.sx ?? 100); pos(p.sy ?? 100);
+      const { rings } = textRings(p);
+      if (!rings.length) throw new ToolError('text: type at least one letter.');
+      const cs = new CrossSection(rings, 'Positive');
+      let m = Manifold.extrude(cs, pos(p.h));
+      cs.delete();
+      // slant: undersides at 45 deg for printing on a wall. u = which way is down, across the
+      // letters' plane. Raised: a point z out stays only where the letter is z further down too.
+      // Cut in: a point d deep stays only where the letter is d further up (the cut's ceiling).
+      // Checked half way and all the way, so a gap in between (a counter) is not bridged.
+      const u = p.slant?.u;
+      if (u && Math.hypot(u[0], u[1]) > 1e-3) {
+        const base = m;
+        for (const f of [0.5, 1]) {
+          const a = -f * u[0], b = -f * u[1];
+          // raised: p = q - f z u; cut in (d = h - z): p = q + f (h - z) u
+          const sh = [1, 0, 0, 0, 0, 1, 0, 0, a, b, 1, 0, p.slant.deboss ? -a * p.h : 0, p.slant.deboss ? -b * p.h : 0, 0, 1];   // 4x4, by columns
+          const s = base.transform(sh), next = m.intersect(s);
+          s.delete();
+          if (m !== base) m.delete();
+          m = next;
+        }
+        base.delete();
+      }
       return m;
     }
     case 'tube': {

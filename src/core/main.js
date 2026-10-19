@@ -15,6 +15,9 @@ import { describe, weld, volume as meshVolume, repair, report } from './meshchec
 import { triangulate } from './tri2d.js';
 import { trace } from './trace.js';
 import { Stereo, STEREO_SCALES } from './stereo.js';
+import { hasGlyph } from './font.js';
+import { Surface, chart, deform, subdivide, gridSolid } from './wrap.js';
+import { textRings } from './text.js';
 
 const { h, button, seg, card, kv, errorLine, ask, mm, count } = ui;
 const SHAPES = {
@@ -26,6 +29,7 @@ const SHAPES = {
   wedge: { x: 20, y: 20, z: 20 },
   tube: { d: 20, wall: 2, h: 20, sides: 64 },
   fillet: { r: 5, length: 20, sides: 64 },
+  text: { text: 'Text', size: 10, width: 1.7, spacing: 0.8, lineGap: 2.5, h: 2, sx: 100, sy: 100, vertical: false },
 };
 const LABELS = { x: 'Width', y: 'Depth', z: 'Height', h: 'Height', d: 'Diameter', d1: 'Bottom diameter', d2: 'Top diameter',
   tube: 'Tube', wall: 'Wall', sides: 'Facets', tubeSides: 'Tube facets', r: 'Radius', length: 'Length', width: 'Line width' };
@@ -242,12 +246,13 @@ function showAccessPop() {
 // ---- tooltips and color schemes (remembered on this computer, with the home folder) ------------
 // Tooltips: any control's title becomes its tip, shown only when switched on; a greyed control's
 // tip says why it is off. Schemes: one accent family each, so nothing rests on telling hues apart.
-let tipsOn = false, scheme = 'green';
+let tipsOn = false, scheme = 'mono';
 const SCHEMES = [
-  ['green', 'Green', 'The default: greens and grays'],
+  ['green', 'Green', 'Greens and grays'],
   ['blue', 'Blue', 'Blues and grays, for red-green color blindness'],
-  ['mono', 'High contrast', 'White and grays only, the most contrast'],
+  ['mono', 'High contrast', 'The default: white and grays only, the most contrast'],
 ];
+document.documentElement.dataset.scheme = scheme;   // the page's colors at once; the view's follow below
 const tipBox = h('div', { class: 'tipbox', role: 'tooltip' });
 document.body.append(tipBox);
 let tipTimer = 0, tipFor = null;
@@ -277,7 +282,8 @@ function setScheme(id, quiet = false) {
   if (!quiet) { folders.remember('scheme', id).catch(() => {}); status(`Color scheme: ${SCHEMES.find(s => s[0] === id)[1]}.`); }
 }
 folders.recall('tips').then(v => { if (v) tipsOn = true; });
-folders.recall('scheme').then(v => { if (SCHEMES.some(s => s[0] === v)) setScheme(v, true); });
+// the remembered scheme, else the default (High contrast); the view gets it either way
+folders.recall('scheme').then(v => setScheme(SCHEMES.some(s => s[0] === v) ? v : scheme, true), () => setScheme(scheme, true));
 
 // ---- menu bar: File, Edit, View ---------------------------------------------------------------
 // items: [label, action, {key, tip, on: () => checked, off: () => disabled}] or '-' for a rule.
@@ -1593,6 +1599,8 @@ function setSel(ids) {
   if (ids.length !== sel.length || ids.some((id, i) => id !== sel[i])) alignLit = false;
   endPast(false);
   if (facePlane && !(ids.length === 1 && ids[0] === facePlane.id)) facePlane = null;
+  // another part picked while text is being wrapped: the wrap is let go (its text comes back flat)
+  if ((wrap || wrapPick) && !(ids.length === 1 && ids[0] === (wrap?.id || wrapPick))) { cancelWrap(); status('Wrap cancelled: another part was selected.'); }
   sel = ids.filter(id => doc.top(id));
   viewer.select(sel);
   viewer.solo(pastHideOthers && sel.length ? [...sel] : null);   // Hide other parts follows the selection
@@ -1682,12 +1690,190 @@ function startSlidePick() {
   status('Click a face to slide along. Esc cancels.');
 }
 viewer.onPickFace = hit => {
+  if (wrapPick) { const id = wrapPick; wrapPick = null; startWrap(id, hit); return; }
   if (!hit?.normal) { status('No face there: slide not set.'); return; }
   const { u, v } = viewer.planeAxes(hit.normal);
   facePlane = { id: sel[0], n: hit.normal, u, v };
   status(`${doc.top(sel[0]).name} slides along that face: arrows, Ctrl+Up/Down off and into it. Click empty space to end.`);
 };
 viewer.onPlace = (what, hit) => { if (what === 'move') placeAt(hit); else { placeAt(hit); commitPlace(); } };
+
+// ---- text onto a part -------------------------------------------------------------------------
+// The text is made flat (and edge shaped) first. Wrap bends that onto another part's surface
+// where it is clicked; a press and drag on that part moves it and it re-forms as it goes. Done
+// keeps it as a mesh part; a deboss is grouped with the part so it cuts. The flat text and the
+// wrap settings stay on the part (flat, wrap), so Flat again brings the text back.
+let wrapPick = null;   // the text part waiting for the click that says where it goes
+let wrap = null;       // { id, target, surf, flat, ext, g, h, anchor, n, up, rot, spiral, mode, tris }
+let wrapFrame = 0;
+function startWrapPick(id) {
+  if (drawing) stopPath();
+  cancelWrap();
+  wrapPick = id;
+  viewer.pickingFace = true;
+  status('Click the part the text goes on, where its middle goes.');
+}
+function startWrap(id, hit) {
+  const p = doc.top(id), m = meshes.get(id);
+  if (!hit?.id || hit.id === id) { status('Click another part: the text goes on its surface.'); return; }
+  const tp = doc.top(hit.id), tm = meshes.get(hit.id);
+  if (!p || !m || !tp || !tm) { status('Still building: try again when the stripes go.'); return; }
+  // the part's surface in the world (a mirrored part's triangles turned back outward)
+  const M = matrix(tp.view || tp.xform), t = tm.tris, wt = new Float32Array(t.length), v = new Vector3();
+  const flip = M.determinant() < 0;
+  for (let i = 0; i < t.length; i += 9) for (let k = 0; k < 3; k++) {
+    const src = i + (flip && k ? (3 - k) * 3 : k * 3);
+    v.set(t[src], t[src + 1], t[src + 2]).applyMatrix4(M);
+    wt[i + k * 3] = v.x; wt[i + k * 3 + 1] = v.y; wt[i + k * 3 + 2] = v.z;
+  }
+  wrap = { id, target: hit.id, surf: new Surface(wt), slant: false, job: 0, ...flatForWrap(p, p.params, m),
+    anchor: hit.point.clone(), n: hit.normal.clone(), up: null, rot: 0, spiral: 0, smooth: 0.5, mode: p.hole ? 'deboss' : 'emboss', tris: null };
+  wrap.up = wrapUp(wrap.n, null);
+  viewer.peek(id, false);
+  viewer.drawTool = wrapTool;
+  reform();
+  renderInspector();
+  status(`Text on ${tp.name}: press and drag on it to move the text. Done keeps it.`);
+}
+/** The flat text at its real size, round its middle, its foot at 0: {base, flat, ext, h, g, scale}.
+ *  Plain text is made here from params (so a slider re-forms it at once) with its faces on a
+ *  square grid (they shade evenly once bent); edge-shaped text is the part's mesh, split. */
+function flatForWrap(p, params, m = meshes.get(p.id)) {
+  const scale = (p.view || p.xform).scale.map(Math.abs), g = Math.max(0.25, Math.min(1, (params?.size || 10) / 12));   // grid, mm
+  let f, s = scale, split = true;
+  if (p.kind === 'text' && !p.ops?.length) {
+    const { rings } = textRings(params);
+    f = gridSolid(rings.map(r => r.map(([x, y]) => [x * s[0], y * s[1]])), params.h * s[2], g);
+    s = [1, 1, 1]; split = false;
+  } else f = m.tris;
+  const lb = localBounds(f), cx = (lb.lo[0] + lb.hi[0]) / 2, cy = (lb.lo[1] + lb.hi[1]) / 2, flat = new Float32Array(f.length);
+  for (let i = 0; i < f.length; i += 3) { flat[i] = (f[i] - cx) * s[0]; flat[i + 1] = (f[i + 1] - cy) * s[1]; flat[i + 2] = (f[i + 2] - lb.lo[2]) * s[2]; }
+  const base = split ? subdivide(flat, g) : flat;
+  return { base, flat: base, scale, g, h: (lb.hi[2] - lb.lo[2]) * s[2],
+    ext: { x0: (lb.lo[0] - cx) * s[0], x1: (lb.hi[0] - cx) * s[0], y0: (lb.lo[1] - cy) * s[1], y1: (lb.hi[1] - cy) * s[1] } };
+}
+/** The wrapped text again from these letter settings (a slider being dragged, or a change kept). */
+function rewrap(params) {
+  const p = wrap && doc.top(wrap.id);
+  if (!p || p.kind !== 'text') return;
+  try { if (!textRings(params).rings.length) return; } catch { return; }
+  Object.assign(wrap, flatForWrap(p, params));
+  if (wrap.slant) refreshFlat(true);
+  reformSoon();
+}
+/** The text's up: on a side, up the surface; on a top or bottom, as it was, else up on screen. */
+function wrapUp(n, prev) {
+  if (Math.abs(n.z) < 0.9) return new Vector3(0, 0, 1).addScaledVector(n, -n.z).normalize();
+  const u = (prev || viewer.planeAxes(n).v).clone();
+  u.addScaledVector(n, -u.dot(n));
+  return u.lengthSq() > 1e-9 ? u.normalize() : viewer.planeAxes(n).v;
+}
+function reform() {
+  if (!wrap) return;
+  // tops round an inside corner at about 1.5 letter heights (they would cross themselves)
+  const c = chart(wrap.surf, wrap.anchor, wrap.n, wrap.up, wrap.ext, wrap.g, wrap.rot, wrap.spiral, wrap.smooth, 1.5 * wrap.h);
+  wrap.tris = deform(wrap.flat, c, wrap.h, wrap.mode);
+  viewer.setPreview(wrap.tris, wrap.mode === 'deboss');
+}
+const reformSoon = () => { if (!wrapFrame) wrapFrame = requestAnimationFrame(() => { wrapFrame = 0; reform(); }); };
+/** Which way is down across the letters at the anchor: [along the line, up the letters]. */
+function wrapDown() {
+  const n = wrap.n.clone().normalize(), u0 = wrap.up.clone().addScaledVector(n, -wrap.up.dot(n)).normalize();
+  const a = (wrap.rot * Math.PI) / 180, up = u0.clone().multiplyScalar(Math.cos(a)).add(n.clone().cross(u0).multiplyScalar(Math.sin(a)));
+  const right = up.clone().cross(n).normalize();
+  return [-right.z, -up.z];
+}
+/** The flat letters again, with their undersides slanted for the way down here when asked
+ *  (made by the reader worker; the last ask wins). */
+let slantWait = 0;
+function refreshFlat(soon = false) {
+  if (!wrap) return;
+  clearTimeout(slantWait);
+  if (soon) { slantWait = setTimeout(() => refreshFlat(), 250); return; }
+  const w = wrap, p = doc.top(w.id), u = wrapDown();
+  if (!w.slant || !p?.params || Math.hypot(u[0], u[1]) < 0.3) {   // on a top or a bottom nothing overhangs
+    if (w.flat !== w.base) { w.flat = w.base; reformSoon(); }
+    if (w.slant) status('Nothing overhangs here: the letters face up or down.');
+    return;
+  }
+  const job = ++w.job;
+  status('Slanting the overhangs...');
+  pool.call('io', { type: 'mesh', part: { id: 'slant', kind: p.kind, params: { ...p.params, slant: { u, deboss: w.mode === 'deboss' } }, xform: IDENT(), ops: p.ops || [], hole: false } }).then(r => {
+    if (wrap !== w || w.job !== job) return;
+    const t = r.tris, lb = localBounds(t), s = w.scale, cx = (lb.lo[0] + lb.hi[0]) / 2, cy = (lb.lo[1] + lb.hi[1]) / 2, f = new Float32Array(t.length);
+    for (let i = 0; i < t.length; i += 3) { f[i] = (t[i] - cx) * s[0]; f[i + 1] = (t[i + 1] - cy) * s[1]; f[i + 2] = (t[i + 2] - lb.lo[2]) * s[2]; }
+    w.flat = subdivide(f, w.g);
+    reformSoon();
+    status('Overhangs slanted to 45 deg.');
+  }).catch(err => { if (wrap === w) status(shortErr(err.message), true); });
+}
+function moveWrap(hit) {
+  wrap.anchor = hit.point.clone();
+  wrap.n = hit.normal.clone();
+  wrap.up = wrapUp(wrap.n, wrap.up);
+  reformSoon();
+}
+const wrapTool = {
+  // a press off the part does nothing (it would drop the selection and the panel with it)
+  grab: e => { if (!wrap) return false; const hit = viewer.placeHit(e); if (hit?.id === wrap.target) moveWrap(hit); return true; },
+  drag: e => { const hit = viewer.placeHit(e); if (wrap && hit?.id === wrap.target) moveWrap(hit); },
+  drop: () => { if (wrap?.slant) refreshFlat(); },
+};
+function cancelWrap() {
+  if (wrapPick) { wrapPick = null; viewer.pickingFace = false; }
+  if (!wrap) return;
+  cancelAnimationFrame(wrapFrame); wrapFrame = 0;
+  viewer.setPreview(null);
+  viewer.peek(wrap.id, true);
+  if (viewer.drawTool === wrapTool) viewer.drawTool = null;
+  wrap = null;
+  renderInspector();
+}
+function finishWrap() {
+  if (!wrap?.tris) return;
+  const w = wrap, p = doc.top(w.id), tp = doc.top(w.target);
+  if (!p || !tp) { cancelWrap(); return; }
+  // its own frame: middle in X and Y, floor at its lowest point, placed back where it is
+  const t = w.tris, b = localBounds(t), c = [(b.lo[0] + b.hi[0]) / 2, (b.lo[1] + b.hi[1]) / 2, b.lo[2]], local = new Float32Array(t.length);
+  for (let i = 0; i < t.length; i += 3) { local[i] = t[i] - c[0]; local[i + 1] = t[i + 1] - c[1]; local[i + 2] = t[i + 2] - c[2]; }
+  const rep = report(local);
+  const blob = doc.addBlob(local);
+  const flat = { kind: p.kind, params: p.params, ops: p.ops, xform: p.xform, hole: !!p.hole };
+  const how = { target: w.target, anchor: w.anchor.toArray(), n: w.n.toArray(), up: w.up.toArray(), rot: w.rot, spiral: w.spiral, smooth: w.smooth, slant: w.slant, mode: w.mode };
+  const xform = { pos: c.map(v => +v.toFixed(6)), rot: [0, 0, 0], scale: [1, 1, 1] };
+  cancelWrap();
+  doc.update([w.id], `Wrap ${p.name} onto ${tp.name}`, q => {
+    q.kind = 'mesh'; q.blob = blob; delete q.params; q.ops = []; q.xform = xform; q.hole = w.mode === 'deboss'; q.flat = flat; q.wrap = how;
+  });
+  ready.set(shapeKey(doc.top(w.id)), { tris: local, volume: Math.abs(meshVolume(local)) });
+  // locked to the part: the two grouped, so they move as one and a cut cuts; the lock in the
+  // group's options lets the text go again
+  const gid = doc.group([w.target, w.id]);
+  if (gid) setSel([gid]);
+  status(`${p.name} ${w.mode === 'deboss' ? 'cut into' : 'locked onto'} ${tp.name}.${rep.watertight ? '' : ` Not closed: ${describe(rep)}.`}`, !rep.watertight);
+}
+const LOCK_SVG = '<svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true"><rect x="2" y="5.5" width="8" height="5.5" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M4 5.5V3.8a2 2 0 0 1 4 0v1.7" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>';
+/** A group holding wrapped text: a lock row; Unlock takes the group apart, the text free to move. */
+function textLockRow(p) {
+  const t = p.children?.find(c => c.wrap);
+  if (!t) return null;
+  const other = p.children.find(c => c !== t);
+  const b = button('Unlock', () => { if (p.locked) { status(`${p.name} is locked (Ctrl+L).`); return; } doc.ungroup(p.id); setSel([t.id]); status(`${t.name} unlocked: it moves on its own; Done on a new wrap locks it again.`); },
+    { small: true, title: 'Take the text off the part, free to move' });
+  const icon = h('span', { class: 'lockicon' });
+  icon.innerHTML = LOCK_SVG;
+  return h('div', { class: 'row lockrow' }, icon, h('span', { class: 'grow' }, `${t.name} locked to ${other?.name || 'the part'}`), b);
+}
+/** A wrapped text part back to its flat text, where it was before the wrap. */
+function flatAgain(id) {
+  const p = doc.top(id);
+  if (!p?.flat) return;
+  doc.update([id], `${p.name}: flat text again`, q => {
+    const f = q.flat;
+    q.kind = f.kind; q.params = f.params; q.ops = f.ops; q.xform = f.xform; q.hole = f.hole;
+    delete q.blob; delete q.flat; delete q.wrap;
+  });
+}
 
 // The parts list (in its flyout) and where the options sit. The options element is never
 // taken out while it is open, so typing in it is not interrupted by a redraw.
@@ -1788,7 +1974,7 @@ function renderInspector(live = null) {
   partOpts.style.display = hide || curTab !== 'parts' ? 'none' : '';
   if (hide) { inspector.style.display = 'none'; inspectorFor = null; return; }
   const key = sel.join();
-  if (!live && inspectorFor === key && inspector.contains(document.activeElement) && document.activeElement.tagName === 'INPUT') return;
+  if (!live && inspectorFor === key && inspector.contains(document.activeElement) && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) return;
   inspectorFor = key;
   inspector.style.display = '';
   if (sel.length > 1) {
@@ -1872,7 +2058,50 @@ function renderInspector(live = null) {
     }
     body.push(ui.tip(h('div', { class: 'sub' }, 'Inside'), 'Hollow: the line alone. Fill: the inside solid. Clear: the inside cuts a hole in what it sits on (in a group).'), inside);
   }
-  if (p.params) {
+  if (p.kind === 'text') {
+    // the words, then the letters' own sizes; sliders stretch and space them
+    const P = p.params;
+    const ta = h('textarea', { class: 'textin', rows: 2, spellcheck: 'false', 'aria-label': 'Text' });
+    ta.value = P.text;
+    let wait = 0;
+    // while it is wrapped, every change here re-forms the wrapped text too (live while dragging)
+    const wrapped = () => wrap?.id === p.id;
+    const live = (k, v) => { if (wrapped()) rewrap({ ...doc.top(p.id).params, [k]: v }); };
+    const kept = () => { if (wrapped()) rewrap(doc.top(p.id).params); };
+    const send = () => { clearTimeout(wait); const v = ta.value; if (v !== doc.top(p.id)?.params.text) { upd(`${p.name}: text`, q => { q.params.text = v; }); kept(); } };
+    ta.addEventListener('input', () => { clearTimeout(wait); live('text', ta.value); wait = setTimeout(send, 500); });
+    ta.addEventListener('change', send);
+    body.push(h('div', { class: 'sub' }, 'Text'), ta);
+    const miss = [...new Set([...P.text].filter(c => c !== '\n' && !hasGlyph(c)))];
+    if (miss.length) body.push(h('div', { class: 'note' }, `Left out: ${miss.join(' ')}`));
+    const set = (k, label) => v => { upd(`${p.name}: ${label.toLowerCase()} ${v}`, q => { q.params[k] = v; }); kept(); };
+    const num = (k, label, o) => ui.numfield(label, P[k], 'mm', set(k, label), { lazy: true, digits: 3, ...o });
+    const sl = (k, label, unit, o) => ui.slider(label, P[k], unit, o, v => live(k, v), set(k, label));
+    body.push(num('size', 'Size', { min: 0.0001, step: 1 }), num('h', 'Height', { min: 0.0001, step: 0.5 }),
+      ui.tip(sl('width', 'Line width', 'mm', { min: 0.2, max: Math.max(4, +(P.size / 2).toFixed(1)), step: 0.05, digits: 2, limits: [0.0001, Infinity] }),
+        'Grows or shrinks every stroke about its centre line.'),
+      sl('spacing', 'Letter spacing', 'mm', { min: -2, max: 10, step: 0.1, digits: 2, limits: [-Infinity, Infinity] }),
+      sl('lineGap', 'Line spacing', 'mm', { min: -2, max: 20, step: 0.1, digits: 2, limits: [-Infinity, Infinity] }),
+      sl('sx', 'Stretch across', '%', { min: 20, max: 400, step: 1, limits: [0.0001, Infinity] }),
+      sl('sy', 'Stretch up', '%', { min: 20, max: 400, step: 1, limits: [0.0001, Infinity] }),
+      ui.check('Vertical', P.vertical, v => { upd(`${p.name}: ${v ? 'vertical' : 'across'}`, q => { q.params.vertical = v; }); kept(); }));
+    if (wrap?.id === p.id) {
+      body.push(h('div', { class: 'sub' }, `On ${doc.top(wrap.target)?.name || 'a part'}`),
+        seg([['emboss', 'Emboss'], ['deboss', 'Deboss']], wrap.mode, v => { wrap.mode = v; if (wrap.slant) refreshFlat(); else reformSoon(); }),
+        ui.slider('Turn', wrap.rot, 'deg', { min: -180, max: 180, step: 1, limits: [-Infinity, Infinity] }, v => { wrap.rot = v; reformSoon(); }, v => { wrap.rot = v; reformSoon(); if (wrap.slant) refreshFlat(true); }),
+        ui.tip(ui.slider('Spiral', wrap.spiral, 'deg', { min: -60, max: 60, step: 1, limits: [-80, 80] }, v => { wrap.spiral = v; reformSoon(); }),
+          'Tilts the line the letters sit on; the letters stay upright. Round a cylinder it climbs as a spiral.'),
+        ui.tip(ui.slider('Smooth over', wrap.smooth, 'mm', { min: 0, max: 10, step: 0.1, digits: 1, limits: [0, Infinity] }, v => { wrap.smooth = v; reformSoon(); }),
+          'Surface detail smaller than this is bridged; larger detail the letters follow. 0 follows every groove and edge.'),
+        ui.tip(ui.check('Slant overhangs', wrap.slant, v => { wrap.slant = v; refreshFlat(); }),
+          'Undersides of the letters (and the ceilings of cut-in letters) at 45 deg, so text on a wall prints without supports.'),
+        h('div', { class: 'row' }, button('Done', () => finishWrap(), { go: true }), button('Cancel', () => cancelWrap())));
+    } else {
+      body.push(h('div', { class: 'row' }, button('Wrap onto a part', () => startWrapPick(p.id), { title: 'Bend the text onto another part: click where it goes, then press and drag to move it' })));
+    }
+  }
+  if (p.flat) body.push(h('div', { class: 'row' }, button('Flat text again', () => flatAgain(p.id), { title: 'Back to the flat text, before it was wrapped' })));
+  if (p.params && p.kind !== 'text') {
     const pf = (k, v, facets, unit = facets ? '' : 'mm') => ui.numfield(LABELS[k] || k, v, unit, nv => upd(`${p.name}: ${(LABELS[k] || k).toLowerCase()} ${nv}`, q => { q.params[k] = facets ? Math.round(nv) : nv; }),
       { min: facets ? 3 : k === 'd2' || k === 'd1' ? 0 : 0.0001, step: facets ? 4 : 1, lazy: true, digits: facets ? 0 : 4 });
     // a box's three sizes on one row
@@ -1885,11 +2114,14 @@ function renderInspector(live = null) {
       body.push(pf(k, v, k === 'sides' || k === 'tubeSides'));
     }
   }
-  if (p.kind === 'group') body.push(h('div', { class: 'row' }, button('Ungroup', () => ungroupSel(), { title: 'Ctrl+Shift+G' })));
+  if (p.kind === 'group') {
+    const lockRow = textLockRow(p);
+    body.push(lockRow || h('div', { class: 'row' }, button('Ungroup', () => ungroupSel(), { title: 'Ctrl+Shift+G' })));
+  }
   if (p.frame && path3dOn) body.push(h('div', { class: 'row' }, button('Edit frame', () => editFrame(doc.top(p.id)), { title: 'Its 3D frame back in Path, where the part is now: add to it, then Make solid updates this part' })));
   // typed sizes for imports, groups and paths (shapes have their own sizes above): the same change
   // as the size handles, kept exactly as typed
-  if (m && (p.kind === 'mesh' || p.kind === 'group' || p.kind === 'path')) {
+  if (m && (p.kind === 'mesh' || p.kind === 'group' || p.kind === 'path' || p.kind === 'text')) {
     const lb = boundsOf(m), sc = (p.view || p.xform).scale;
     body.push(trio('Size, mm', ['Width', 'Depth', 'Height'].map((label, i) => {
       const cur = (lb.hi[i] - lb.lo[i]) * Math.abs(sc[i]);
@@ -2292,6 +2524,12 @@ function handleResult(d, h, e) {
     // the line keeps its width: the points spread so the outside comes to the size asked
     const w = P.width, fp = [0, 1].map(j => { const ext = (hi[j] - lo[j]) * Math.abs(s[j]); return af[j] === 1 || ext - w < 1e-9 ? af[j] : (af[j] * ext - w) / (ext - w); });
     P.pts = P.pts.map(([x, y]) => [+(x * fp[0]).toFixed(6), +(y * fp[1]).toFixed(6)]);
+    mul('h', 2);
+  }
+  else if (kind === 'text') {
+    // the letters keep their line width: the centre lines stretch so the outside comes to the size asked
+    const w = P.width, fp = [0, 1].map(j => { const ext = (hi[j] - lo[j]) * Math.abs(s[j]); return af[j] === 1 || ext - w < 1e-9 ? af[j] : (af[j] * ext - w) / (ext - w); });
+    P.sx = +(P.sx * fp[0]).toFixed(4); P.sy = +(P.sy * fp[1]).toFixed(4);
     mul('h', 2);
   }
   else if (kind === 'cylinder' || kind === 'tube') { mul('d', 0); mul('h', 2); if (e.shiftKey) mul('wall', 0); }
@@ -3781,6 +4019,7 @@ window.addEventListener('keydown', e => {
   }
   if (placing && k === 'enter') return act(() => commitPlace(true));
   if (placing && k === 'escape') return act(cancelPlace);
+  if ((wrap || wrapPick) && k === 'escape') return act(() => { cancelWrap(); status('Wrap cancelled.'); });
   if (viewer.pickingFace && k === 'escape') return act(() => { viewer.pickingFace = false; status('Slide cancelled.'); });
   if (facePlane && sel.length === 1 && sel[0] === facePlane.id && k.startsWith('arrow')) return act(() => {
     // slide along the face it was placed on (Ctrl: straight off or into it)

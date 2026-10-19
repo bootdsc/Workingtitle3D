@@ -1,5 +1,6 @@
 // Edge profiles on flat parts, in the worker. Every edge: the outline shaped in rings (core/rings.js).
 // Some edges: the profile swept along each and cut away by the solid engine.
+import ClipperLib from 'clipper-lib';
 import { ToolError } from '../../core/meshcheck.js';
 import { S, flatPart } from '../../core/flat.js';
 import { shapeOutline } from '../../core/rings.js';
@@ -15,7 +16,42 @@ export async function run(tris, p, ctx) {
   const lv = levels(p, t);
   const top = p.face === 'top' || p.face === 'both' ? lv : null;
   const bottom = p.face === 'bottom' || p.face === 'both' ? lv.map(([d, z]) => [d, t - z]) : null;
-  return { tris: shapeOutline(part.region, part.z0, t, top, bottom, ctx.progress), notes: [`Rings: ${lv.length}. Part ${t.toFixed(2)} mm thick.`] };
+  const out = trimFace(shapeOutline(part.region, part.z0, t, top, bottom, ctx.progress), part.z0, t, p.face, ctx.kernel, part.region, lv[lv.length - 1][0]);
+  return { tris: out, notes: [`Rings: ${lv.length}. Part ${t.toFixed(2)} mm thick.`] };
+}
+
+// Where the profile is wider than half a stroke, the treated face shrinks to nothing and its
+// last ring is closed by flat triangles bridging across it. Stretched TRIM taller and cut back
+// to its height, the part ends in a clean flat face at the treated side instead.
+const TRIM = 0.01;   // mm
+/** Does the treated face shrink to nothing somewhere (a stroke under twice the profile's width)?
+ *  Each piece of the outline taken in by w must still be there, in one piece. */
+function collapses(region, w) {
+  for (const P of region) {
+    const co = new ClipperLib.ClipperOffset(2, 0.01 * S);
+    // outer counter-clockwise, holes clockwise, so a negative offset takes the piece in
+    const way = (r, outer) => (ClipperLib.Clipper.Orientation(r) === outer ? r : r.slice().reverse());
+    co.AddPaths([way(P.outer, true), ...P.holes.map(hr => way(hr, false))], ClipperLib.JoinType.jtRound, ClipperLib.EndType.etClosedPolygon);
+    const out = new ClipperLib.Paths();
+    co.Execute(out, -(w - 0.005) * S);
+    if (out.filter(r => ClipperLib.Clipper.Area(r) > 0).length !== 1) return true;
+  }
+  return false;
+}
+function trimFace(tris, z0, t, face, K, region, w) {
+  if (!K || !(t > TRIM) || !collapses(region, w)) return tris;
+  const { M } = K, z1 = z0 + t, both = face === 'both';
+  const f = (t + (both ? 2 : 1) * TRIM) / t;
+  // the side that stays put while stretching: the untreated face (the middle when both)
+  const at = both ? z0 + t / 2 : face === 'bottom' ? z1 : z0;
+  const s = K.toManifold(tris);
+  const grown = s.transform([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, f, 0, 0, 0, at * (1 - f), 1]);
+  let cut = grown;
+  if (face !== 'bottom') { const c = cut.trimByPlane([0, 0, -1], -z1); if (cut !== grown) cut.delete(); cut = c; }
+  if (face !== 'top') { const c = cut.trimByPlane([0, 0, 1], z0); if (cut !== grown) cut.delete(); cut = c; }
+  const out = K.toTris(cut);
+  for (const m of new Set([s, grown, cut])) m.delete();
+  return out;
 }
 
 // ---- some edges only ----------------------------------------------------------------------
@@ -100,7 +136,7 @@ async function picked(tris, p, ctx) {
   const solid = K.toManifold(tris);
   const cut = M.Manifold.union(cutters);
   const out = solid.subtract(cut);
-  const res = K.toTris(out);
+  const res = trimFace(K.toTris(out), part.z0, t, p.face, K, part.region, w);
   for (const m of [...cutters, cut, out, solid]) m.delete();
   const n = chosen.length;
   return { tris: res, notes: [`${n} edge${n === 1 ? '' : 's'} shaped. Part ${t.toFixed(2)} mm thick.`] };

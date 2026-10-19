@@ -105,6 +105,14 @@ aside .btn.small { min-height: 24px; padding: 2px 8px; font-size: inherit; }
 .field input::placeholder { color: var(--gray); }
 .field .unit { color: var(--gray); font-size: 12px; padding-right: 6px; }
 .field.bad .box { border-color: var(--yellow); }
+.textin { display: block; width: 100%; box-sizing: border-box; margin-top: 3px; resize: vertical; min-height: 40px;
+  font: 14px var(--sans, 'Segoe UI', sans-serif); color: var(--glow); background: var(--black);
+  border: 1px solid var(--border); border-radius: 3px; padding: 4px 6px; outline: 0; }
+.textin:focus { border-color: var(--green-dim); }
+.row.lockrow { display: flex; align-items: center; gap: 6px; color: var(--gray-lt); font-size: 12px; }
+.row.lockrow .btn { flex: 0 0 auto; width: auto; }
+.lockrow .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lockicon { display: inline-flex; color: var(--green); }
 .sub { margin-top: 6px; color: var(--gray); font-size: 12px; }
 /* three boxes on a row: a letter before each (the full name stays in the label, sized away) */
 .trio > .sub { display: flex; align-items: center; justify-content: space-between; }
@@ -260,7 +268,7 @@ body.stereo dialog::backdrop { background: transparent; }
 .pathfly .keyhint { margin: 2px 0 6px; font-size: 12px; color: var(--gray-lt); }
 .pathfly .keyhint b { font-family: var(--mono); font-weight: 400; color: var(--gray-lt); border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; }
 /* snap faces: the same place as the measure readout, but it has buttons */
-.snapbar { position: absolute; top: 46px; left: 50%; transform: translateX(-50%); display: flex; gap: 8px; align-items: center;
+.snapbar { position: absolute; z-index: 5; top: 46px; left: 50%; transform: translateX(-50%); display: flex; gap: 8px; align-items: center;
   background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; color: var(--gray-lt); font-size: 12px; white-space: nowrap; }
 .snapbar .seg { min-width: 300px; }
 /* auto save off: plain text at the right end of the status line, underlined only under the pointer */
