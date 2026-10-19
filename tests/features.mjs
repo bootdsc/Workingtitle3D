@@ -459,12 +459,42 @@ try {
   step('hollow: no switch, two picked faces open', noSwitch && /2 faces picked/.test(facesPicked) && /added to/.test(hs2), `${facesPicked}; ${hs2}`);
   await page.keyboard.down('Control'); await page.keyboard.press('z'); await page.keyboard.up('Control'); await settle();
 
-  // ---- busy bar: shows and moves while work runs, gone after ---------------------------------------------
+  // the owner's case: a 20 x 20 x 4 box, wall 2.4, top and bottom picked (bottom from under the plate)
   await addShape('Box');
-  await click('.inspector .btn', 'Hollow');
+  await setField('Height', 4); await settle();
+  await click('.inspector .btn', 'Hollow'); await sleep(300);
+  await page.$$eval('.inspector .field', fs => { const f = fs.find(x => x.querySelector('label').textContent === 'Wall thickness'); const i = f.querySelector('input'); i.value = '2.4'; i.dispatchEvent(new Event('input')); i.dispatchEvent(new Event('change')); });
+  await sleep(300);
+  const bn4 = await page.evaluate(() => { const v = document.getElementById('view').viewer; return v.objs.get([...v.selected][0]).part.name; });
+  // the camera round the box's middle (local 0, 0, 2), from above and from under the plate
+  const cam4 = async (x, y, z) => page.evaluate(([x, y, z]) => { const v = document.getElementById('view').viewer, o = v.objs.get([...v.selected][0]); o.group.updateMatrixWorld(); const c = new o.mesh.position.constructor(0, 0, 2).applyMatrix4(o.group.matrixWorld); v.camera.position.set(c.x + x, c.y + y, c.z + z); v.controls.target.copy(c); v.controls.update(); v.request(); }, [x, y, z]);
+  const mx4 = -3, my4 = -3;
+  await cam4(30, -40, 50); await sleep(300);
+  let [px, py] = await onScreen(bn4, mx4, my4, 4); await page.mouse.click(px, py); await sleep(300);
+  await cam4(30, -40, -50); await sleep(300);
+  [px, py] = await onScreen(bn4, mx4, my4, 0); await page.mouse.click(px, py); await sleep(300);
+  const picked4 = await statusText();
   await click('aside .btn', 'Apply');
-  await sleep(600);
-  const busyOn = await page.evaluate(() => { const f = document.querySelector('footer'), i = f.querySelector('.busybar i'); return { busy: f.classList.contains('busy'), moving: i.getAnimations().some(a => a.playState === 'running') }; });
+  const hs4 = await waitStatus(/added to|ERROR|did not/, 60000);
+  await settle();
+  const vol4 = await page.evaluate(() => { const v = document.getElementById('view').viewer; return [...document.querySelectorAll('.inspector .kv div')].map(d => d.textContent).join(' '); });
+  step('the owner\'s 20 x 20 x 4 box, wall 2.4, top and bottom open: hollowed', /2 faces picked/.test(picked4) && /added to/.test(hs4) && /0\.68 cm3/.test(vol4), `${picked4}; ${hs4}; ${vol4.match(/[\d.]+ cm3/)?.[0]}`);
+  await page.keyboard.down('Control'); await page.keyboard.press('z'); await page.keyboard.up('Control'); await settle();
+
+  // ---- busy bar: shows and moves while work runs, gone after ---------------------------------------------
+  await addShape('Sphere');   // round: the grid hollow (a box is flat, hollowed exactly and at once)
+  await click('.inspector .btn', 'Hollow');
+  // fine enough to take a while (the 1 mm default is done before the bar can be looked at)
+  // (and a wall no other hollow here uses, so it is not a result already in the cache)
+  await page.$$eval('.inspector .field', fs => { const f = fs.find(x => x.querySelector('label').textContent === 'Detail'); const i = f.querySelector('input'); i.value = '0.2'; i.dispatchEvent(new Event('change')); });
+  await page.$$eval('.inspector .field', fs => { const f = fs.find(x => x.querySelector('label').textContent === 'Wall thickness'); const i = f.querySelector('input'); i.value = '1.7'; i.dispatchEvent(new Event('input')); });
+  await click('aside .btn', 'Apply');
+  // the bar shows 150 ms after work starts (not for blinks): look for it for up to 5 s
+  let busyOn = { busy: false, moving: false };
+  for (let i = 0; i < 50 && !busyOn.busy; i++) {
+    await sleep(100);
+    busyOn = await page.evaluate(() => { const f = document.querySelector('footer'), i = f.querySelector('.busybar i'); return { busy: f.classList.contains('busy'), moving: i.getAnimations().some(a => a.playState === 'running') }; });
+  }
   await shot('16-busy-bar');
   await waitStatus(/added to|ERROR/, 120000); await sleep(600);
   const busyOff = await page.evaluate(() => document.querySelector('footer').classList.contains('busy'));
@@ -538,7 +568,7 @@ try {
     const labels = await page.$$eval('.menu.open .mitem:not(:disabled) .mlabel', l => l.map(x => x.textContent));
     await page.keyboard.press('Escape');
     for (const l of labels) {
-      if (/^(New|Import|Theme builder|Background|Plate|Keys)/.test(l)) continue;   // tested above, or opens a file chooser
+      if (/^(New|Import|Theme builder|Background|Plate|Keys|Stereo)/.test(l)) continue;   // tested above or in stereo.mjs, or opens a file chooser
       try { await menuItem(m, l); } catch { continue; }
       await sleep(250);
       await sleep(700);

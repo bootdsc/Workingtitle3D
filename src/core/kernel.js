@@ -20,6 +20,9 @@ export async function initKernel(wasmBinary) {
   return starting;
 }
 
+/** What a tool step gets as ctx.kernel: the solid engine and the mesh converters (tests use it too). */
+export const toolKernel = () => ({ M, toManifold, toTris });
+
 // ---- recipe keys -------------------------------------------------------------------------
 import { shapeKey } from './doc.js';
 export { shapeKey };
@@ -96,6 +99,27 @@ function primitive(kind, p) {
       const solid = Manifold.extrude(prof, L).rotate([90, 0, 0]).translate([-r / 2, L / 2, 0]);
       prof.delete();
       return solid;
+    }
+    case 'path': {
+      // a drawn line: each stretch a stadium (two circles of the line's width and the hull round
+      // them), all joined, so bends and ends are round; a closed loop's inside filled when asked;
+      // pushed up h. Points are [x, y] in the part's own plane.
+      const pts = p.pts || [];
+      if (pts.length < 2) throw new ToolError('path: it needs two points or more.');
+      const r = pos(p.width) / 2, n = sides(p.sides);
+      const pieces = [];
+      const runs = p.closed ? pts.length : pts.length - 1;
+      for (let i = 0; i < runs; i++) {
+        const a = CrossSection.circle(r, n).translate(pts[i]), b = CrossSection.circle(r, n).translate(pts[(i + 1) % pts.length]);
+        pieces.push(CrossSection.hull([a, b]));
+        a.delete(); b.delete();
+      }
+      if (p.closed && p.fill === 'fill' && pts.length >= 3) pieces.push(new CrossSection([pts], 'NonZero'));
+      const cs = CrossSection.union(pieces);
+      for (const x of pieces) x.delete();
+      const m = Manifold.extrude(cs, pos(p.h));
+      cs.delete();
+      return m;
     }
     case 'tube': {
       if (!(p.wall > 0) || p.wall * 2 >= p.d) throw new ToolError('tube: the wall must be above zero and under half the diameter.');
@@ -221,14 +245,22 @@ export async function local(part, ctx) {
     // a first step that works on the file as read (repair) gets the raw triangles
     const first = part.ops?.[0] && ctx.tools[part.ops[0].tool];
     if (first?.raw) {
-      const out = await first.run(tris, part.ops[0].params, { selection: [], progress: ctx.progress || (() => {}), kernel: { M, toManifold, toTris } });
+      const out = await first.run(tris, part.ops[0].params, { selection: [], progress: ctx.progress || (() => {}), kernel: toolKernel() });
       if (out.notes) for (const t of out.notes) note(t);
       tris = out.tris || out;
       skip = 1;
     }
     shape = asShape(tris);
   } else shape = { man: primitive(part.kind, part.params), soup: null };
-  for (const op of (part.ops || []).slice(skip)) {
+  // steps work on the part at its real size: scale it, run the steps, then take the scale back
+  // off, since the part's xform puts it on again (a 10 mm fillet on a part stretched 3x stays
+  // 10 mm). Mirroring stays in the xform. Picks are stored unscaled and scaled here to match.
+  const ops = (part.ops || []).slice(skip);
+  const k = ops.length ? (part.xform?.scale || [1, 1, 1]).map(Math.abs) : [1, 1, 1];
+  const scaled = k.some(v => v !== 1);
+  if (scaled) shape = scaleShape(shape, k);
+  for (const op0 of ops) {
+    const op = scaled ? { ...op0, sel: scaleSel(op0.sel, k) } : op0;
     const tool = ctx.tools[op.tool];
     if (!tool) throw new ToolError(`No tool called ${op.tool}.`);
     let tris;
@@ -241,11 +273,12 @@ export async function local(part, ctx) {
     tris = shapeTris(shape);
     // picked edges travel as plan segments; several picked faces as a list, each found again here
     const sel = op.sel?.segs ? op.sel : op.sel?.faces ? op.sel.faces.map(s => resolveFace(tris, s)) : resolveFace(tris, op.sel);
-    const out = await tool.run(tris, op.params, { selection: sel, progress: ctx.progress || (() => {}), kernel: { M, toManifold, toTris } });
+    const out = await tool.run(tris, op.params, { selection: sel, progress: ctx.progress || (() => {}), kernel: toolKernel() });
     if (out.notes) for (const t of out.notes) note(t);
     freeShape(shape);
     shape = asShape(out.tris || out);
   }
+  if (scaled) shape = scaleShape(shape, k.map(v => 1 / v));
   remember(key, shape);
   return shape;
 }
@@ -269,6 +302,24 @@ function shapeTris(shape) {
   return parts.length === 1 ? parts[0] : concat(parts);
 }
 function freeShape(shape) { shape.man?.delete(); }
+/** A shape this function owns, scaled per axis (k all positive); the old one is freed. */
+function scaleShape(shape, k) {
+  const x = { scale: k }, out = { man: shape.man ? place(shape.man, x) : null, soup: shape.soup ? placeSoup(shape.soup, x) : null };
+  if (out.man !== shape.man) freeShape(shape);
+  return out;
+}
+/** A stored pick in the unscaled frame to the frame scaled by k: points and plan segments
+ *  stretch, a face's normal turns the other way (n / k), and its plane follows. */
+function scaleSel(sel, k) {
+  if (!sel) return sel;
+  if (sel.segs) return { ...sel, segs: sel.segs.map(([x1, y1, x2, y2]) => [x1 * k[0], y1 * k[1], x2 * k[0], y2 * k[1]]) };
+  const face = s => {
+    const p = s.point.map((v, i) => v * k[i]), n = s.normal.map((v, i) => v / k[i]), l = Math.hypot(...n);
+    const nn = n.map(v => v / l);
+    return { ...s, normal: nn, point: p, d: nn[0] * p[0] + nn[1] * p[1] + nn[2] * p[2] };
+  };
+  return sel.faces ? { ...sel, faces: sel.faces.map(face) } : face(sel);
+}
 
 /** Close an open surface for a step that needs a solid: repair first, and if that cannot,
  *  rebuild it on a grid fine enough for its size. */

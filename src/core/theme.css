@@ -85,9 +85,15 @@ aside .tabrow .tabs { flex: 1; }
 
 .seg { display: flex; background: var(--hex); border: 1px solid var(--border); border-radius: 3px; padding: 1px; gap: 1px; }
 .seg button { flex: 1; font: inherit; background: none; border: 0; border-radius: 3px; color: var(--gray);
-  padding: 3px 6px; cursor: pointer; }
+  padding: 1px 6px; min-height: 20px; cursor: pointer; }
 .seg button:hover { background: var(--hex-hover); color: var(--glow); }
-.seg button.on { background: var(--green-dk); color: var(--glow); font-weight: 700; }
+/* lit the same as a lit button (.btn.go): fill, edge, text and weight */
+.seg button.on { background: var(--green-dk); box-shadow: inset 0 0 0 1px var(--green-dim); color: var(--glow); font-weight: 600; }
+/* the selection count: faint, top right of the view, under the header, never in the way */
+.selcount { position: absolute; top: 40px; right: 10px; z-index: 2; color: var(--gray); font-size: 12px; pointer-events: none; opacity: .8; }
+/* the panel: every button one height, one font size (a segmented pair is 24 px with its frame, as a button is) */
+aside .btn.small { min-height: 24px; padding: 2px 8px; font-size: inherit; }
+.seg button.off, .seg button.off:hover { background: none; color: var(--border); cursor: default; font-weight: 400; }
 
 .field { display: grid; grid-template-columns: 1fr 92px; align-items: center; gap: 6px; margin-top: 3px; }
 .field label { color: var(--gray-lt); }
@@ -100,6 +106,19 @@ aside .tabrow .tabs { flex: 1; }
 .field .unit { color: var(--gray); font-size: 12px; padding-right: 6px; }
 .field.bad .box { border-color: var(--yellow); }
 .sub { margin-top: 6px; color: var(--gray); font-size: 12px; }
+/* three boxes on a row: a letter before each (the full name stays in the label, sized away) */
+.trio > .sub { display: flex; align-items: center; justify-content: space-between; }
+.trio > .sub .check { margin-top: 0; color: var(--gray-lt); font-size: 13px; }
+.trio-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin-top: 3px; }
+.field.mini { grid-template-columns: auto minmax(0, 1fr); gap: 3px; margin-top: 0; }
+.field.mini label { font-size: 0; }
+.field.mini label::before { content: attr(data-s); font-size: 12px; color: var(--gray); font-family: var(--mono); }
+.field.mini input { padding: 2px 4px; }
+/* color and Hide other parts on one row */
+.pairrow { display: flex; align-items: center; gap: 10px; }
+.pairrow > .check { margin-top: 0; white-space: nowrap; }
+.row.steps { gap: 3px; }
+.row.steps > .btn { padding-left: 4px; padding-right: 4px; }
 
 input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 18px; background: none; margin: 0; }
 input[type=range]::-webkit-slider-runnable-track { height: 4px; background: var(--border); border-radius: 3px; }
@@ -157,7 +176,7 @@ input[type=checkbox]:checked::after { content: ""; width: 7px; height: 4px; bord
 #view.dragging { outline: 2px dashed var(--green-dim); outline-offset: -8px; }
 
 /* shapes, parts, inspector */
-.shapes { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.shapes { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; }
 .parts { display: flex; flex-direction: column; gap: 2px; }
 .parts p { margin: 0; }
 .prow { display: flex; justify-content: space-between; gap: 6px; font: inherit; text-align: left; background: none;
@@ -210,6 +229,44 @@ footer .msg { overflow: hidden; text-overflow: ellipsis; background: rgba(10,10,
 /* working: the status grows and a barber pole runs beside it (text color and black stripes at
    45 degrees, sliding sideways). transform only, so the compositor keeps it moving through a hang */
 footer { align-items: center; gap: 8px; }
+/* the key strip: faint, over the foot of the view, clear of the move-step column on the left; the
+   mouse goes straight through it */
+.keystrip { position: absolute; left: 330px; right: 8px; bottom: 22px; display: flex; flex-wrap: wrap; justify-content: center;
+  gap: 2px 14px; font-size: 12px; line-height: 17px; color: var(--gray); opacity: .7; pointer-events: none; text-shadow: 0 0 3px var(--bg), 0 0 3px var(--bg); }
+.keystrip b { font-family: var(--mono); font-weight: 400; color: var(--gray-lt); }
+/* measure readout: under the menus, middle of the view; the distance large, then X Y Z */
+.measurebox { position: absolute; top: 46px; left: 50%; transform: translateX(-50%); display: flex; gap: 14px; align-items: baseline;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 12px; color: var(--gray-lt);
+  font-family: var(--mono); font-size: 13px; pointer-events: none; white-space: nowrap; }
+.measurebox b { font-size: 17px; font-weight: 400; }
+.measurebox span { color: var(--gray); }
+/* stereo (View > Stereo): the app in the left half (placed by stereo.js), its mirror in the right,
+   black all round; dialogs inside the left half, no backdrop across both */
+body.stereo { background: #000; overflow: hidden; }
+body.stereo #app { position: fixed; }
+.stereo-blinds { position: fixed; inset: 0; background: #000; z-index: 9998; pointer-events: none; }
+.stereo-mirror { position: fixed; inset: 0; z-index: 9999; overflow: hidden; }
+.stereo-ptr { position: fixed; left: 0; top: 0; width: 24px; height: 24px; z-index: 10000; pointer-events: none; background: no-repeat 0 0 / 24px 24px; }
+body.stereo dialog { position: fixed; margin: 0; left: calc(var(--st-l) + var(--st-w) / 2); top: calc(var(--st-t) + var(--st-h) / 2);
+  transform: translate(-50%, -50%); max-width: calc(var(--st-w) - 16px); max-height: calc(var(--st-h) - 16px); }
+body.stereo dialog::backdrop { background: transparent; }
+/* the Path list: tool buttons with their keys, then the line's sizes and Finish / Point back / Cancel */
+.pathfly { width: 230px; }
+.pathfly .pathtools { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin: 6px 0; }
+.pathfly .pathtools .btn { display: flex; justify-content: space-between; align-items: center; }
+.pathfly .pathtools .mkey { font-family: var(--mono); color: var(--gray); margin-left: 6px; }
+.pathfly .pathtools .btn.go .mkey { color: var(--glow); }
+/* a held key and what it does: the key in the key font, as on the buttons */
+.pathfly .keyhint { margin: 2px 0 6px; font-size: 12px; color: var(--gray-lt); }
+.pathfly .keyhint b { font-family: var(--mono); font-weight: 400; color: var(--gray-lt); border: 1px solid var(--border); border-radius: 3px; padding: 0 5px; }
+/* snap faces: the same place as the measure readout, but it has buttons */
+.snapbar { position: absolute; top: 46px; left: 50%; transform: translateX(-50%); display: flex; gap: 8px; align-items: center;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; color: var(--gray-lt); font-size: 12px; white-space: nowrap; }
+.snapbar .seg { min-width: 300px; }
+/* auto save off: plain text at the right end of the status line, underlined only under the pointer */
+.autosave-note { margin-left: auto; color: var(--gray); text-decoration: none; background: rgba(10,10,10,.85); border-radius: 3px;
+  padding: 0 6px; pointer-events: auto; white-space: nowrap; }
+.autosave-note:hover, .autosave-note:focus-visible { color: var(--glow); text-decoration: underline; }
 footer.busy .msg { font-size: 14px; line-height: 22px; font-weight: 600; color: var(--gray-lt); padding: 1px 8px; }
 .busybar { display: none; flex: none; width: 180px; height: 14px; border: 2px solid var(--border); border-radius: 3px;
   background: #000; overflow: hidden; }
@@ -287,8 +344,9 @@ dialog .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12
 .citem .ctick { color: var(--glow); font-weight: 700; }
 .citem .chip { width: 16px; height: 12px; border-radius: 3px; border: 1px solid var(--gray); }
 .citem .rv { font: 11px var(--mono); color: var(--gray); }
-.colorbtn { width: 100%; text-align: left; font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
-.colorbtn::after { content: " \25C2"; float: right; color: var(--gray); }
+.colorbtn { display: inline-flex; align-items: center; gap: 6px; flex: none; white-space: nowrap; }
+.colorbtn .chip { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--gray); }
+.inspector > .colorbtn { margin-top: 6px; align-self: flex-start; }
 .field.wide { grid-template-columns: 110px 1fr; }
 
 /* floating panels over the view: plate picture, background picture, theme builder */
@@ -335,6 +393,13 @@ dialog .field.wide .seg { min-width: 0; }
 .pane > .shapeopts:not([style*="none"]) { flex: 1 0 auto; display: flex; flex-direction: column; }
 .shapeopts > .inspector:not([style*="none"]) { flex: 1 0 auto; display: flex; flex-direction: column; }
 .inspector > .infobox { margin-top: auto; padding-top: 8px; }
+/* outer size: a captioned frame, no fill and no hover, so it never reads as a button */
+.dims { position: relative; display: grid; grid-template-columns: repeat(3, 1fr); margin: 10px 0 6px;
+  padding: 10px 4px 5px; border: 1px solid var(--border); border-radius: 4px; cursor: default; user-select: text; }
+.dims .cap { position: absolute; top: -8px; left: 8px; padding: 0 4px; background: var(--panel); color: var(--gray); font-size: 11px; }
+.dims .d { text-align: center; }
+.dims b { display: block; font-family: var(--mono); font-size: 17px; font-weight: 400; color: var(--gray-lt); }
+.dims .d span { color: var(--gray); font-size: 11px; }
 /* the Keys tab: keys in the column font, what they do in words, wrapping */
 .kv.keys { grid-template-columns: auto 1fr; gap: 3px 10px; }
 .kv.keys .k { font-family: var(--mono); color: var(--gray-lt); white-space: nowrap; }

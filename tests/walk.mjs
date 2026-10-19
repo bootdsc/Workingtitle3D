@@ -189,7 +189,7 @@ try {
   await selectRow('Box 1'); await selectRow('Cone 1', true);
   const ugOff = await page.$$eval('.inspector .btn', bs => bs.find(b => b.textContent === 'Ungroup')?.disabled);
   const rows = await page.$$('.inspector .row.align');
-  for (const b of await rows[0].$$('.btn')) if ((await b.evaluate(n => n.textContent)) === 'Min') { await b.click(); break; }
+  for (const b of await rows[0].$$('.btn')) if ((await b.evaluate(n => n.textContent)) === 'Left') { await b.click(); break; }   // X: Left (was Min)
   await settle();
   const xs = [];
   for (const nm of ['Box 1', 'Cone 1']) { await selectRow(nm); xs.push(await page.$$eval('.inspector .field', fs => { const f = fs.find(f => /^(Width|Diameter|Bottom diameter)$/.test(f.querySelector('label').textContent)); const c = fs.find(f => f.querySelector('label').textContent === 'Center X'); return [+c.querySelector('input').value, +(f?.querySelector('input').value || 0)]; })); }

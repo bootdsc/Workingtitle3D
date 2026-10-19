@@ -6,13 +6,15 @@ import tools from 'virtual:tools-ui';
 import { stlBytes, sizeText } from './decimate.js';
 import { Viewer } from './viewer.js';
 import * as ui from './ui.js';
-import { Vector3, Box3, Quaternion, Euler, Matrix4 } from 'three';
+import { Vector3, Box3, Quaternion, Euler, Matrix4, Matrix3, Plane } from 'three';
 import { Doc, shapeKey, formKey, IDENT, matrix } from './doc.js';
 import { Project, packProject, unpackProject, PROJECT_EXT } from './project.js';
 import * as folders from './folders.js';
 import { browserHome } from './idbfs.js';
-import { describe, weld, volume as meshVolume } from './meshcheck.js';
+import { describe, weld, volume as meshVolume, repair, report } from './meshcheck.js';
+import { triangulate } from './tri2d.js';
 import { trace } from './trace.js';
+import { Stereo, STEREO_SCALES } from './stereo.js';
 
 const { h, button, seg, card, kv, errorLine, ask, mm, count } = ui;
 const SHAPES = {
@@ -26,7 +28,7 @@ const SHAPES = {
   fillet: { r: 5, length: 20, sides: 64 },
 };
 const LABELS = { x: 'Width', y: 'Depth', z: 'Height', h: 'Height', d: 'Diameter', d1: 'Bottom diameter', d2: 'Top diameter',
-  tube: 'Tube', wall: 'Wall', sides: 'Facets', tubeSides: 'Tube facets', r: 'Radius', length: 'Length' };
+  tube: 'Tube', wall: 'Wall', sides: 'Facets', tubeSides: 'Tube facets', r: 'Radius', length: 'Length', width: 'Line width' };
 const MOVE_STEPS = [0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 1, 5];
 let moveStep = 1;   // mm per arrow press, drag snap and size handle; picked bottom left of the view
 let plate = { w: 600, d: 600, every: 1 };   // the grid, for this session
@@ -58,12 +60,15 @@ function flyout(cls) {
 function placeFlyout(el, anchor) {
   const side = aside.getBoundingClientRect();
   el.style.display = '';
-  // the color list goes beside the parts list when that is open, never under it
-  const edge = el !== partFly && partFlyOpen ? partFly.getBoundingClientRect().left : side.left;
+  // side by side from the panel leftward: the parts list, the Path list, the color list; never one under another
+  const order = [partFly, pathFly, colorFly].filter(f => f === el || f.style.display !== 'none');
+  const prev = order[order.indexOf(el) - 1];
+  const edge = prev ? prev.getBoundingClientRect().left : side.left;
   el.style.right = Math.max(4, innerWidth - edge + 6) + 'px';
-  // with no anchor: under the floating header, so its buttons stay reachable
-  const want = anchor ? anchor.getBoundingClientRect().top - 6 : Math.max(side.top + 4, header.getBoundingClientRect().bottom + 6);
-  const floor = anchor ? 6 : want;
+  // every list starts at the same height: under the floating header, so its buttons stay
+  // reachable (lining up with what opened it put each at a different height)
+  const want = Math.max(side.top + 4, header.getBoundingClientRect().bottom + 6);
+  const floor = want;
   el.style.maxHeight = (innerHeight - floor - 6) + 'px';
   const hgt = el.offsetHeight;
   el.style.top = Math.max(floor, Math.min(want, innerHeight - hgt - 6)) + 'px';
@@ -107,16 +112,22 @@ for (const fly of [colorFly]) fly.addEventListener('keydown', e => {
   items[(i + (e.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length].focus();
 });
 
+// no browser right-click menu over the app (a right drag to orbit that starts over a button or a
+// list opened it); text and number boxes keep it, for copy and paste
+document.addEventListener('contextmenu', e => { if (!e.target.closest?.('input, textarea, [contenteditable=true]')) e.preventDefault(); });
+
 // a hex box selects all on focus, so typing replaces the old value (as the number boxes do)
 document.addEventListener('focusin', e => { if (e.target.matches?.('.hex-in')) setTimeout(() => e.target.select(), 0); });
 
-/** Color row: the label, and one button with the color's name that opens the list. */
+/** One button, "Color" with a chip of the current color, that opens the list. */
 function colorPicker(current, onpick) {
-  const b = h('button', { type: 'button', class: 'btn colorbtn', 'aria-haspopup': 'listbox', title: 'Pick a color' }, colorName(current));
+  const chip = (current || '').toLowerCase() === OLD_GRAY ? DEFAULT_COLOR : (current || DEFAULT_COLOR);
+  const b = h('button', { type: 'button', class: 'btn colorbtn', 'aria-haspopup': 'listbox', title: `Color: ${colorName(current)}. Click to pick another` },
+    h('span', { class: 'chip', style: `background:${chip}` }), 'Color');
   b.addEventListener('click', () => { if (colorFor?.anchor === b) closeColors(); else openColors(b, current, onpick); });
   // the panel redraws after a pick: an open list moves to the new button
   if (colorFor) requestAnimationFrame(() => { if (colorFor && b.isConnected) { colorFor.anchor = b; placeFlyout(colorFly, b); } });
-  return h('div', { class: 'field' }, h('label', {}, 'Color'), b);
+  return b;
 }
 
 // ---- workers ------------------------------------------------------------------------------
@@ -212,6 +223,20 @@ function showGridPop(on) {
     ui.numfield('Depth', plate.d, 'mm', v => set('d', v), { min: 0.1, step: 10, lazy: true, digits: 1 }),
     ui.numfield('Line every', plate.every, 'mm', v => set('every', v), { min: 0.01, step: 1, lazy: true, digits: 2 }),
     h('div', { class: 'note' }, 'Kept for this session.'),
+    h('div', { class: 'row' }, button('Done', () => showGridPop(false), { small: true })));
+}
+// View > Accessibility...: settings for how the app is worked, remembered on this computer. It
+// shares the Grid panel's place under the menus (one of them shows at a time).
+let zoomSpeed = 5;
+folders.recall('zoomspeed').then(v => { if (v >= 1 && v <= 10) zoomSpeed = viewer.zoomSpeed = v; }).catch(() => {});
+function showAccessPop() {
+  gridPop.style.display = '';
+  gridPop.replaceChildren(h('h3', {}, 'Accessibility'),
+    ui.tip(ui.slider('Scroll to zoom speed', zoomSpeed, '', { min: 1, max: 10, step: 1 },
+      v => { zoomSpeed = viewer.zoomSpeed = v; },
+      v => { folders.remember('zoomspeed', v).catch(() => {}); status(`Scroll to zoom speed ${v} (5 is the usual).`); }),
+    'How far one notch of the wheel zooms: 1 is a fine creep, 10 twice the usual'),
+    h('div', { class: 'note' }, '5 is the usual speed.'),
     h('div', { class: 'row' }, button('Done', () => showGridPop(false), { small: true })));
 }
 // ---- tooltips and color schemes (remembered on this computer, with the home folder) ------------
@@ -317,7 +342,7 @@ const menubar = h('nav', { class: 'menubar' },
   ]),
   menu('Edit', [
     ['Undo', () => undo(), { key: 'Ctrl+Z', off: () => !doc.at && 'Nothing to undo' }],
-    ['Redo', () => redo(), { key: 'Ctrl+Y', off: () => doc.at >= doc.history.length && 'Nothing to redo' }],
+    ['Redo', () => redo(), { key: 'Ctrl+Shift+Z', off: () => !sel.length && doc.at >= doc.history.length && 'Nothing to redo' }],
     '-',
     ['Copy', () => copySel(), { key: 'Ctrl+C', off: none }],
     ['Paste', () => paste(), { key: 'Ctrl+V', off: () => !clipboard && 'Copy a part first' }],
@@ -328,6 +353,8 @@ const menubar = h('nav', { class: 'menubar' },
     ['Group', () => groupSel(), { key: 'Ctrl+G', off: () => sel.length < 2 && 'Select two or more parts' }],
     ['Intersect', () => groupSel('intersect'), { key: 'Ctrl+I', off: () => sel.length < 2 && 'Select two or more parts', tip: 'Keep only where the selected parts overlap' }],
     ['Ungroup', () => ungroupSel(), { key: 'Ctrl+Shift+G', off: () => !sel.some(id => doc.top(id)?.kind === 'group') && 'Select a group: this is a single piece' }],
+    '-',
+    ['Snap faces...', () => startFaceSnap(), { tip: 'Click a face to snap to, then a face on another part: that part turns and moves onto the first face' }],
     '-',
     ['Mirror X', () => mirrorSel(0), { key: 'M', off: none }],
     ['Mirror Y', () => mirrorSel(1), { key: 'Shift+M', off: none }],
@@ -340,13 +367,19 @@ const menubar = h('nav', { class: 'menubar' },
   menu('View', [
     ['Show faults', () => setFaults(!faultsOn), { on: () => faultsOn, tip: 'Mark where parts are not closed: open, over-shared and wrongly turned edges, in yellow' }],
     ['Show grid', () => { gridOn = !gridOn; viewer.setGrid(gridOn); }, { on: () => gridOn }],
+    ['Measure', () => setMeasure(!measureOn), { on: () => measureOn, key: 'T', tip: 'Click two points, on parts or the plate, for the distance between them' }],
+    ['3D path (work in progress)', () => setPath3d(!path3dOn), { on: () => path3dOn, tip: 'Off by default, still being built: the 3D frame tool in Path, for drawing in space' }],
     ['Grid...', () => showGridPop(true), { tip: 'Grid size and line spacing' }],
     '-',
     ['Background picture...', () => showBackdropPanel(), { tip: 'A picture behind the model, tilted and scaled to line up with it' }],
     ['Plate picture...', () => showPlatePicPanel(), { tip: 'A picture lying on the plate under the grid, to model over' }],
     '-',
     ['Key bindings', () => setKeysTab(!keysTab), { on: () => keysTab, tip: 'A Keys tab beside Parts listing every mouse move and key' }],
+    ['Key strip', () => setKeyStrip(!keyStripOn), { on: () => keyStripOn, tip: 'The everyday keys, faint along the bottom of the view' }],
     ['Tooltips', () => setTips(!tipsOn), { on: () => tipsOn, tip: 'Show what a control does when the pointer rests on it' }],
+    ['Accessibility...', () => showAccessPop(), { tip: 'Scroll to zoom speed' }],
+    ['Stereo', () => setStereo(!stereo.on), { on: () => stereo.on, tip: 'Side by side for phone goggles and headsets: the app twice, an eye each' }],
+    ['Stereo settings...', () => showStereoPop(), { tip: 'Size of each half, and eye separation' }],
     '-',
     ...SCHEMES.map(([id, label, tip]) => [label, () => setScheme(id), { on: () => scheme === id && !customTheme, tip }]),
     ['Theme builder...', () => showThemeBuilder(), { on: () => !!customTheme, tip: 'Make your own colors for the app and the view, see them live, save and load them as files' }],
@@ -357,26 +390,56 @@ const header = h('header', {},
   h('span', { class: 'popwrap' }, gridPop),
   h('span', { class: 'spacer' }), projBtn, importInput, projInput);
 
+// Path: lit while it is in use (a second press closes it)
+const pathBtn = button('Path', () => { if (drawing) { stopPath(); status('Path closed.'); } else startPath(); }, { title: 'Draw lines, arcs, circles and rectangles by clicking, on the plate or a face (P)' });
 const shapeGrid = h('div', { class: 'shapes' }, ...Object.keys(SHAPES).map(k => {
   const b = button(k[0].toUpperCase() + k.slice(1), () => addShape(k), { title: `Add a ${k} on the plate` });
   return b;
-}));
+}), pathBtn);
 const stepCard = h('div');
 const inspector = h('div', { class: 'inspector', style: 'display:none' });
-/** The Keys tab: every mouse move and key the app answers to. */
+/** Every mouse move and key the app answers to: [key, what it does, the word on the key strip (none: not on it)].
+ *  The Keys tab and the key strip are both made from this one list. */
+const KEYS = [
+  ['Mouse', [['Right drag', 'turn the view'], ['Ctrl + left drag', 'turn the view'], ['Middle drag', 'pan'], ['Wheel', 'zoom to the pointer'],
+    ['Left drag on a part', 'move it'], ['Alt + drag', 'move a copy'], ['Left drag on empty space', 'select by box'], ['Shift + click', 'add to the selection']]],
+  ['View', [['F', 'fit the selection, or all', 'fit'], ['+  /  -', 'zoom', 'zoom'], ['Shift + F', 'slide along a face you click'], ['R (hold)', 'show the turn rings', 'rings'], ['T', 'measure between two points (Esc ends it)', 'measure']]],
+  ['Path (while it is open)', [['P', 'open or close Path', 'path'], ['V', 'pointer: select and move parts, Path stays open'], ['L / A / C / R', 'line, arc, circle, rectangle'], ['K', 'delete: click a stretch of a line to remove it; U takes it back'],['3', '3D frame on / off: a line under way joins the frame; off, flat again from its last point'],['E', 'edit the selected frame part\'s frame (3D frame or Pointer)'],['F', 'finish the line, open'],
+    ['U', 'undo the last point'], ['X', 'cancel the line']]],
+  ['3D frame (in Path)', [['Shift (hold)', 'move the mouse up or down: lift or lower the point'], ['D  /  F', 'draw / fill faces'], ['B', 'make solid'], ['N', 'end the strand, or fill the loop'], ['U', 'undo the last step'],
+    ['G', 'draw on the plate (again: let go)'], ['Space', 'lock points to the upright grid as it stands (again: unlock)']]],
+  ['Parts', [['Arrows', 'move one step (Shift: ten)', 'move'], ['Ctrl + Up / Down', 'raise / lower', 'raise'], ['D', 'drop to the plate', 'drop'], ['H  /  S', 'hole / solid', 'hole / solid'],
+    ['M', 'mirror X (Shift: Y, Alt: Z)', 'mirror'], ['Delete', 'delete', 'delete'], ['Esc', 'deselect, or close', 'deselect'], ['F2', 'rename (in the parts list)']]],
+  ['Edit', [['Ctrl + Z', 'undo (with parts selected: only them)', 'undo'], ['Ctrl + Shift + Z', 'redo (with parts selected: only them)', 'redo'], ['Ctrl + A', 'select all'], ['L', 'several parts selected: light up Align in the panel'], ['Ctrl + C / X / V', 'copy / cut / paste', 'copy / cut / paste'], ['Ctrl + D', 'duplicate', 'duplicate'],
+    ['Ctrl + G', 'group', 'group'], ['Ctrl + Shift + G', 'ungroup'], ['Ctrl + I', 'intersect'], ['Ctrl + L', 'lock', 'lock'], ['Ctrl + H', 'hide', 'hide'], ['Ctrl + Shift + H', 'show all']]],
+  ['File', [['Ctrl + O', 'open'], ['Ctrl + E', 'export', 'export'], ['Ctrl + Shift + E', 'export again, to a place you pick']]],
+];
+/** The Keys tab. */
+// 3D path keys: listed only while View > 3D path is on (off, they do nothing, so they are not shown)
+const is3dKey = (head, k) => head === '3D frame (in Path)' || (head === 'Path (while it is open)' && (k === '3' || k === 'E'));
 function keysCard() {
-  const rows = [
-    ['Mouse', [['Right drag', 'turn the view'], ['Ctrl + left drag', 'turn the view'], ['Middle drag', 'pan'], ['Wheel', 'zoom to the pointer'],
-      ['Left drag on a part', 'move it'], ['Alt + drag', 'move a copy'], ['Left drag on empty space', 'select by box'], ['Shift + click', 'add to the selection']]],
-    ['View', [['F', 'fit the selection, or all'], ['+  /  -', 'zoom'], ['Shift + F', 'slide along a face you click'], ['R (hold)', 'show the turn rings']]],
-    ['Parts', [['Arrows', 'move one step (Shift: ten)'], ['Ctrl + Up / Down', 'raise / lower'], ['D', 'drop to the plate'], ['H  /  S', 'hole / solid'],
-      ['M', 'mirror X (Shift: Y, Alt: Z)'], ['Delete', 'delete'], ['Esc', 'deselect, or close'], ['F2', 'rename (in the parts list)']]],
-    ['Edit', [['Ctrl + Z', 'undo'], ['Ctrl + Y', 'redo'], ['Ctrl + A', 'select all'], ['Ctrl + C / X / V', 'copy / cut / paste'], ['Ctrl + D', 'duplicate'],
-      ['Ctrl + G', 'group'], ['Ctrl + Shift + G', 'ungroup'], ['Ctrl + I', 'intersect'], ['Ctrl + L', 'lock'], ['Ctrl + H', 'hide'], ['Ctrl + Shift + H', 'show all']]],
-    ['File', [['Ctrl + O', 'open'], ['Ctrl + E', 'export'], ['Ctrl + Shift + E', 'export again, to a place you pick']]],
-  ];
-  return card('Keys', ...rows.map(([head, list]) => h('div', {}, h('div', { class: 'sub' }, head),
+  const keys = KEYS.filter(([head]) => path3dOn || head !== '3D frame (in Path)').map(([head, list]) => [head, list.filter(([k]) => path3dOn || !is3dKey(head, k))]);
+  return card('Keys', ...keys.map(([head, list]) => h('div', {}, h('div', { class: 'sub' }, head),
     h('div', { class: 'kv keys' }, list.flatMap(([k, v]) => [h('div', { class: 'k' }, k), h('div', { class: 'v' }, v)])))));
+}
+/** The key strip: the everyday keys, faint along the foot of the view, never in the way of the mouse. */
+const keyStrip = h('div', { class: 'keystrip', style: 'display:none', 'aria-hidden': 'true' },
+  ...KEYS.flatMap(([, list]) => list.filter(r => r[2]).map(([k, , s]) => h('span', {}, h('b', {}, k.replace(/\s+/g, ' ')), ' ', s))));
+// 3D path: the 3D frame tool, a work in progress, off unless switched on in View
+let path3dOn = false;
+function setPath3d(on) {
+  path3dOn = on;
+  folders.remember('path3d', on).catch(() => {});
+  if (!on && drawing?.tool === 'frame') setPathTool('frame');   // (3 again: back to flat)
+  if (drawing) renderPathFly();
+  renderInspector(); panes.keys.replaceChildren(keysCard());
+  status(on ? '3D path on (a work in progress): 3D frame (3) is in the Path list.' : '3D path off: Path draws flat only.');
+}
+let keyStripOn = false;
+function setKeyStrip(on) {
+  keyStripOn = on;
+  keyStrip.style.display = on ? '' : 'none';
+  folders.remember('keystrip', on).catch(() => {});
 }
 
 // one panel on the right, full height, tabs at the very top, each tab scrolls:
@@ -388,7 +451,9 @@ const shapeOpts = h('div', { class: 'card shapeopts', style: 'display:none' });
 const partOpts = h('div', { class: 'card shapeopts', style: 'display:none' });
 const partsHint = h('div', { class: 'card' }, h('p', {}, 'Select a part in the view or in the list.'),
   h('div', { class: 'row' }, button('Parts list', () => openPartList(true), { title: 'Open the list of parts beside the panel' })));
-const panes = { shapes: h('div', { class: 'pane' }, card('Shapes', shapeGrid), shapeOpts),
+// the Shapes card heads Shape tools only: Parts gives the part's panel the whole height
+const shapesCard = card('Shapes', shapeGrid);
+const panes = { shapes: h('div', { class: 'pane' }, shapesCard, shapeOpts),
   parts: h('div', { class: 'pane', style: 'display:none' }, partsHint, partOpts),
   keys: h('div', { class: 'pane', style: 'display:none' }, keysCard()) };
 let curTab = 'shapes';
@@ -403,6 +468,8 @@ function setKeysTab(on) {
   if (on) showTab('keys'); else if (curTab === 'keys') showTab('shapes');
 }
 folders.recall('keystab').then(v => { if (v) { keysTab = true; keysTabBtn.style.display = ''; } });
+folders.recall('path3d').then(v => { if (v) { path3dOn = true; if (drawing) renderPathFly(); renderInspector(); panes.keys.replaceChildren(keysCard()); } }).catch(() => {});
+folders.recall('keystrip').then(v => { if (v) { keyStripOn = true; keyStrip.style.display = ''; } }).catch(() => {});
 tabs.classList.add('tabs');
 tabs.addEventListener('click', e => {
   if (app.classList.contains('folded')) fold.click();
@@ -431,7 +498,7 @@ function openPartList(on) {
   partFlyOpen = on;
   partFly.style.display = on ? '' : 'none';
   if (on) { renderParts(); placeFlyout(partFly, null); }
-  if (colorFor) placeFlyout(colorFly, colorFor.anchor);
+  placePathFly();   // the Path and color lists move beside the parts list, and back when it shuts
 }
 partFly.addEventListener('keydown', e => {
   if (e.key === 'Escape' && !e.target.closest('input')) { e.stopPropagation(); openPartList(false); tabs.querySelector('[data-v="parts"]')?.focus(); return; }
@@ -441,7 +508,7 @@ partFly.addEventListener('keydown', e => {
   e.preventDefault(); e.stopPropagation();
   rows[Math.max(0, Math.min(rows.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))].focus();
 });
-window.addEventListener('resize', () => { if (partFlyOpen) placeFlyout(partFly, null); if (colorFor) placeFlyout(colorFly, colorFor.anchor); });
+window.addEventListener('resize', () => { if (partFlyOpen) placeFlyout(partFly, null); placePathFly(); });
 // the arrow rolls the panel up to its tab row, and the view takes the width
 const fold = h('button', { class: 'fold', title: 'Roll the panel up' }, '▴');
 fold.onclick = () => {
@@ -452,6 +519,8 @@ fold.onclick = () => {
 const aside = h('aside', {}, h('div', { class: 'tabrow' }, tabs, fold), panes.parts, panes.shapes, panes.keys);
 
 const view = h('div', { id: 'view' });
+// how many parts are selected, faint at the top right of the view (only when more than one)
+const selCount = h('div', { class: 'selcount', style: 'display:none', 'aria-live': 'polite' });
 const dropHint = h('div', { class: 'drop' }, h('b', {}, 'Add a shape, or drop an STL, 3MF, OBJ, STEP or a picture here'), 'Right drag orbits, middle drag pans, wheel zooms. Nothing leaves this computer.');
 // the cut: a position in mm along X, Y or Z, in move steps like a part's moves; Cut here splits
 let cutAxis = null, cutAt = 0;
@@ -601,6 +670,769 @@ function bringIn() {
 cutSeg.title = 'Cut the view open along X, Y or Z';
 const cut = h('div', { class: 'overlay cutbar' }, cutSeg, cutBox, cutBtn);
 const pastBanner = h('div', { class: 'banner', style: 'display:none' });
+
+// ---- measure (T, View > Measure): there from the start, nothing to place first ----------------
+// Clicks pick points on a part (a corner of the face when one is within 8 px) or on the plate;
+// two points give the distance, in a readout under the menus and the status line, never by the
+// part. A third click starts again. Esc clears the points, then ends it.
+let measureOn = false, mPts = [];
+const measureBox = h('div', { class: 'measurebox', style: 'display:none', role: 'status' });
+const snapBar = h('div', { class: 'snapbar', style: 'display:none' });   // snap faces: where on the face
+function setMeasure(on) {
+  measureOn = on; mPts = [];
+  viewer.setMeasure([]);
+  measureBox.style.display = on ? '' : 'none';
+  if (on) { measureText(); status('Measure: click two points, on a part or the plate. Esc or T ends it.'); }
+  else status('Measure off.');
+}
+function measureText() {
+  if (mPts.length < 2) { measureBox.replaceChildren(mPts.length ? 'Click the second point' : 'Click the first point'); return; }
+  const d = mPts[1].clone().sub(mPts[0]), f = v => Math.abs(v).toFixed(2);
+  measureBox.replaceChildren(h('b', {}, `${d.length().toFixed(2)} mm`), h('span', {}, `X ${f(d.x)}`), h('span', {}, `Y ${f(d.y)}`), h('span', {}, `Z ${f(d.z)}`));
+  status(`Distance ${d.length().toFixed(2)} mm (X ${f(d.x)}, Y ${f(d.y)}, Z ${f(d.z)}).`);
+}
+// ---- path (P, or Path under Shape tools): lines, arcs, circles and rectangles, by clicking -----
+// Path lights its button and opens a list beside the panel (as the color list does). While it is
+// open its keys are its own: L line, A arc, C circle, R rectangle, Enter finish, Backspace a point
+// back, Esc cancel the piece (Esc again closes Path). The first click of each piece sets its
+// height: the plate, or the spot clicked on a part. The piece is drawn level there, X and Y only.
+// Points land in move steps (Shift: a line's stretch turns in 15 degree steps).
+//   Line: click points; the first point again closes the loop; Finish (or the last point again) ends it open.
+//   Arc: from the last point (or a first click), a click it passes through, then where it ends.
+//   Circle: the middle, then a point on it. Rectangle: one corner, then the opposite one.
+// Each finished piece is a part: a line of the width and height set in the list, round at bends
+// and ends; a closed one's inside (hollow, filled, or cut through) is set in the panel after.
+let drawing = null;   // { tool, plane: { o, n, u, v, rot }, pts: [[a, b]] in the plane from o, mark }
+const pathSet = { width: 1, h: 1 };
+const pathFly = flyout('pathfly');
+const PATH_TOOLS = [['pointer', 'Pointer', 'V'], ['line', 'Line', 'L'], ['arc', 'Arc', 'A'], ['circle', 'Circle', 'C'], ['rect', 'Rectangle', 'R'], ['erase', 'Delete', 'K'], ['frame', '3D frame', '3']];
+const PATH_HINT = {
+  get pointer() { return path3dOn ? 'Clicks select and move parts again, and a 3D frame\'s points can be dragged (Shift: up and down). Pick a tool to draw.' : 'Clicks select and move parts again. Pick a tool to draw.'; },
+  line: 'Click points. F finishes the line; clicking the first point again closes it into a loop.',
+  arc: 'From the last point: click where it passes, then where it ends.',
+  circle: 'Click the middle, then a point on the circle.',
+  rect: 'Click one corner, then the opposite one.',
+  get erase() { return path3dOn ? 'Click a stretch of a line, or a frame point or edge, to remove it. U takes it back.' : 'Click a stretch of a line to remove it: an open line splits in two, a loop opens. U takes it back.'; },
+};
+
+// ---- 3D frame (Path, key 3): a wireframe drawn in space, its faces chosen after, made solid ------
+// Draw (D): click points. A point moves on the level of the last one; with Shift it moves on the
+// upright plane through the last one, facing you, so the line climbs or drops. Points land in move
+// steps, and a click within 8 px of a frame point joins to it and carries on from there; Enter ends
+// a strand (the next click starts a new one). The status line gives the point's X Y Z.
+// Faces (F): click the corners of a loop in order; the first corner again fills it.
+// Make solid (B): every edge of the faces must be shared by exactly two faces, or it says how many
+// are open and marks them; closed, the faces become a part. The frame is kept while Path is closed,
+// and Backspace takes back the last step of any kind.
+// Locks (they stay until switched off): Draw on the plate (G) puts every point on the build plate,
+// for a flat outline; Lock plane (Space) freezes the upright grid as it is drawn,
+// so turn the view until the grid faces the way wanted, press Space, and points stay on that grid.
+const frame = { verts: [], edges: [], cur: null, mode: 'draw', faces: [], faceCur: [], hist: [], open: [], plate: false, lock: null };
+const FRAME_HINT = {
+  draw: 'Click points. Click a point again to join it, or drag it to move it; N ends a strand.',
+  faces: 'Click the corners of a loop in order; the first corner again fills it.',
+};
+function frameSave() {
+  frame.hist.push(JSON.stringify({ verts: frame.verts, edges: frame.edges, cur: frame.cur, faces: frame.faces, faceCur: frame.faceCur, partId: frame.partId ?? null }));
+  if (frame.hist.length > 500) frame.hist.shift();
+}
+function frameBack() {
+  const s = frame.hist.pop();
+  if (!s) return;
+  Object.assign(frame, JSON.parse(s), { open: [] });
+  showFrame(null); renderPathFly();
+}
+/** The frame point within px pixels of the pointer, or -1. */
+function frameNear(e, px = 8, skip = -1) {
+  let best = -1, bd = px;
+  frame.verts.forEach((v, i) => { if (i === skip) return; const [x, y] = onScreen(new Vector3(...v)); const d = Math.hypot(x - e.clientX, y - e.clientY); if (d <= bd) { bd = d; best = i; } });
+  return best;
+}
+/** Where a click would put a new point: on the plate or a part to start; then on the level of the
+ *  last point, in move steps from it; with Shift held, lifted or lowered by the mouse. */
+function framePoint(e) {
+  // every point inside the plate's area and never under the plate (a ray grazing the level met it
+  // far off and drew lines out of sight)
+  const q = framePointRaw(e);
+  return q && [Math.max(-plate.w / 2, Math.min(plate.w / 2, q[0])), Math.max(-plate.d / 2, Math.min(plate.d / 2, q[1])), Math.max(0, q[2])].map(v => +v.toFixed(6));
+}
+/** A step (x, y) from the last point: as a line (length in move steps, direction in whole degrees)
+ *  or on the move-step grid, whichever is nearer the mouse. The line gives fine angles; the grid
+ *  keeps exact corners (a 20 x 20 diagonal is 28.28 mm, which no whole-step length reaches). */
+function polar(x, y) {
+  const st = v => Math.round(v / moveStep) * moveStep;
+  const len = st(Math.hypot(x, y));
+  const a = (Math.round((Math.atan2(y, x) * 180) / Math.PI) * Math.PI) / 180;
+  const p = [len * Math.cos(a), len * Math.sin(a)], g = [st(x), st(y)];
+  return Math.hypot(p[0] - x, p[1] - y) < Math.hypot(g[0] - x, g[1] - y) ? p : g;
+}
+function framePointRaw(e) {
+  const st = v => Math.round(v / moveStep) * moveStep;
+  if (frame.plate) {
+    // on the plate: X and Y on the move-step lattice, Z 0
+    const p = new Vector3();
+    if (!viewer.ray(e).ray.intersectPlane(new Plane(new Vector3(0, 0, 1), 0), p)) return null;
+    return [onLattice(p.x), onLattice(p.y), 0].map(v => +v.toFixed(6));
+  }
+  if (frame.lock) {
+    // on the locked plane: from the last point, the length in move steps and the direction in whole
+    // degrees (snapping across and up separately gave blocky angles on short lines)
+    const L = frame.lock, p = new Vector3();
+    if (!viewer.ray(e).ray.intersectPlane(new Plane().setFromNormalAndCoplanarPoint(L.n, L.o), p)) return null;
+    const b = frame.cur != null ? new Vector3(...frame.verts[frame.cur]) : L.o;
+    const d = p.sub(b), [du, dv] = polar(d.dot(L.u), d.dot(L.v));
+    const q = b.clone().addScaledVector(L.u, du).addScaledVector(L.v, dv);
+    return [q.x, q.y, q.z].map(v => +v.toFixed(6));
+  }
+  // where the point would be on the level (the plate or a part for the first one)
+  let flat;
+  if (frame.lift) flat = frame.lift.base;
+  else if (frame.cur == null) {
+    const hit = viewer.placeHit(e);
+    if (!hit) return null;
+    flat = [onLattice(hit.point.x), onLattice(hit.point.y), hit.normal ? hit.point.z : 0].map(v => +v.toFixed(6));
+  } else {
+    const b = new Vector3(...frame.verts[frame.cur]), p = new Vector3();
+    if (!viewer.ray(e).ray.intersectPlane(new Plane().setFromNormalAndCoplanarPoint(new Vector3(0, 0, 1), b), p)) return null;
+    const [dx, dy] = polar(p.x - b.x, p.y - b.y);
+    flat = [b.x + dx, b.y + dy, b.z].map(v => +v.toFixed(6));
+  }
+  if (!e.shiftKey) { frame.lift = null; return flat; }
+  // Shift: the point stays where it is across the plate, and the mouse going up or down lifts or
+  // lowers it, at the view's scale there, in move steps; from any angle, straight down included.
+  // (An upright plane facing the viewer read heights only from the side, and ran away seen from above.)
+  // Shift going down over a frame point (12 px) lifts from that point itself: a line straight up from it
+  if (!frame.lift) {
+    const i = frameNear(e, 12), base = i >= 0 ? [...frame.verts[i]] : flat;
+    frame.lift = { base, y0: e.clientY, mmPx: viewer.pxAt(new Vector3(...base)) };
+  }
+  const L = frame.lift;
+  return [L.base[0], L.base[1], +(L.base[2] + st((L.y0 - e.clientY) * L.mmPx)).toFixed(6)];
+}
+function frameClick(e) {
+  // lifting: no joins (let go of Shift to join); drawing: the last point never catches the mouse,
+  // so a 1 mm step is a 1 mm step at any zoom
+  const i = e.shiftKey && frame.mode === 'draw' ? -1 : frameNear(e, 8, frame.mode === 'draw' ? frame.cur ?? -1 : -1);
+  if (frame.mode === 'faces') {
+    if (i < 0) return;
+    frameSave();
+    if (frame.faceCur.length >= 3 && i === frame.faceCur[0]) {
+      frame.faces.push(frame.faceCur); frame.faceCur = [];
+      status(`${frame.faces.length} face${frame.faces.length > 1 ? 's' : ''}. Fill more loops, or Make solid (B).`);
+    } else if (!frame.faceCur.includes(i)) frame.faceCur.push(i);
+  } else {
+    let j = i;
+    const q = j < 0 ? framePoint(e) : null;
+    if (j < 0 && !q) return;
+    frameSave();
+    if (j < 0) { frame.verts.push(q); j = frame.verts.length - 1; }
+    frame.lift = null;   // a held Shift lifts again from the new point
+    const c = frame.cur;
+    if (c != null && j !== c && !frame.edges.some(([a, b]) => (a === c && b === j) || (a === j && b === c))) frame.edges.push([c, j]);
+    frame.cur = j;
+  }
+  frame.open = [];
+  showFrame(null); renderPathFly();
+}
+// Moving frame points: a press on one (Pointer, or Draw) and a drag moves it on its own level in move
+// steps; Shift during the drag lifts or lowers it (from where it is when Shift goes down, so it never
+// jumps). Never off the plate's area or under it. One undo step a move. A press that does not move
+// is a click: in Draw it joins the point, as before.
+let fgrab = null;   // { i, x0, y0, from, shift, ly, moved, ev }
+function frameGrab(e) {
+  const t = drawing?.tool;
+  if (!path3dOn || !(t === 'pointer' || (t === 'frame' && frame.mode === 'draw')) || !frame.verts.length) return false;
+  const i = frameNear(e);
+  if (i < 0) return false;
+  fgrab = { i, x0: e.clientX, y0: e.clientY, from: [...frame.verts[i]], shift: e.shiftKey, ly: e.clientY, moved: false,
+    ev: { clientX: e.clientX, clientY: e.clientY, shiftKey: e.shiftKey } };
+  viewer.renderer.domElement.style.cursor = 'grabbing';
+  return true;
+}
+function frameDrag(e) {
+  const g = fgrab;
+  if (!g) return;
+  if (!g.moved && Math.hypot(e.clientX - g.x0, e.clientY - g.y0) < 4) return;
+  if (!g.moved) { g.moved = true; frameSave(); }
+  if (e.shiftKey !== g.shift) { g.shift = e.shiftKey; g.from = [...frame.verts[g.i]]; g.ly = e.clientY; }
+  const st = v => Math.round(v / moveStep) * moveStep, b = new Vector3(...g.from);
+  let q;
+  if (e.shiftKey) q = [b.x, b.y, b.z + st((g.ly - e.clientY) * viewer.pxAt(b))];
+  else {
+    const p = new Vector3();
+    if (!viewer.ray(e).ray.intersectPlane(new Plane(new Vector3(0, 0, 1), -b.z), p)) return;
+    q = [b.x + st(p.x - b.x), b.y + st(p.y - b.y), b.z];
+  }
+  q = [Math.max(-plate.w / 2, Math.min(plate.w / 2, q[0])), Math.max(-plate.d / 2, Math.min(plate.d / 2, q[1])), Math.max(0, q[2])].map(v => +v.toFixed(6));
+  frame.verts[g.i] = q; frame.open = [];
+  showFrame(null);
+  status(`X ${q[0].toFixed(2)}   Y ${q[1].toFixed(2)}   Z ${q[2].toFixed(2)}   (moving a point; Shift: up and down)`);
+}
+function frameDrop() {
+  const g = fgrab;
+  fgrab = null;
+  viewer.renderer.domElement.style.cursor = '';
+  if (!g) return;
+  if (!g.moved) { if (drawing?.tool === 'frame') frameClick(g.ev); return; }
+  renderPathFly();
+  const part = frame.partId && doc.top(frame.partId);
+  status(`Point moved.${part ? ` Make solid (B) updates ${part.name}.` : ''} U takes it back.`);
+}
+function setFramePlate(on) {
+  frame.plate = on;
+  if (on) frame.lock = null;
+  renderPathFly(); showFrame(null);
+  status(on ? 'Drawing on the plate: every point at Z 0. G again lets go.' : 'Drawing in space again.');
+}
+/** Lock the plane through the last point (or the middle of the view), square to the view; again: unlock. */
+function toggleFrameLock() {
+  if (frame.lock) { frame.lock = null; status('Plane unlocked: points follow the last point\'s level again (Shift: up and down).'); }
+  else {
+    // the upright grid as it stands: vertical, through the last point, at the gauge's whole-degree
+    // heading. (Square to the view, camera tilt and all, it leaned back into the depth: points meant
+    // to go up went up and away.)
+    // Nothing recomputed: the lock is a copy of the grid last drawn, so locking cannot move it.
+    frame.plate = false;   // (on the plate no grid is drawn: let go first, so the copy is the current one)
+    frameGrid(null);
+    const { o, u, deg } = shownGrid;
+    frame.lock = { o: o.clone(), u: u.clone(), v: new Vector3(0, 0, 1), n: new Vector3(-u.y, u.x, 0), deg };
+    status(`Plane locked: the upright grid at ${deg}° from X, through the last point. Points move on it, up and across. Space unlocks.`);
+  }
+  renderPathFly(); showFrame(null);
+}
+function frameEnter() {
+  if (frame.mode === 'draw') { frame.cur = null; status('Strand ended. ' + FRAME_HINT.draw); }
+  else if (frame.faceCur.length >= 3) { frameSave(); frame.faces.push(frame.faceCur); frame.faceCur = []; }
+  showFrame(null); renderPathFly();
+}
+/** Triangles (9 numbers each) filling the faces: each loop flattened on its own best plane. */
+function frameTris(faces) {
+  const out = [];
+  for (const f of faces) {
+    const P = f.map(i => new Vector3(...frame.verts[i]));
+    const n = new Vector3();   // Newell's normal: right for bent loops too
+    for (let k = 0; k < P.length; k++) { const a = P[k], b = P[(k + 1) % P.length]; n.x += (a.y - b.y) * (a.z + b.z); n.y += (a.z - b.z) * (a.x + b.x); n.z += (a.x - b.x) * (a.y + b.y); }
+    if (n.lengthSq() < 1e-18) continue;
+    n.normalize();
+    const u = (Math.abs(n.z) < 0.9 ? new Vector3(0, 0, 1) : new Vector3(1, 0, 0)).cross(n).normalize(), v = n.clone().cross(u);
+    const { tris, extra } = triangulate([P.map(p => [p.dot(u), p.dot(v)])]);
+    const pts = [...P];
+    const o = n.clone().multiplyScalar(P[0].dot(n));
+    for (const [x, y] of extra) pts.push(o.clone().addScaledVector(u, x).addScaledVector(v, y));
+    for (const k of tris) out.push(pts[k].x, pts[k].y, pts[k].z);
+  }
+  return out;
+}
+/** The reference grid while drawing a frame in space: upright through the current point (or the
+ *  middle of the view), square to the view, from 100 mm under the plate to 150 mm over it, lines
+ *  every 10 mm (stronger every 50 and at the plate); on the locked plane when it is locked; with a
+ *  line from the pointer's point straight to the plate. None when drawing on the plate. */
+let gridAngle = null;   // the Path list's readout of the upright grid's turn
+let shownGrid = null;   // the upright grid last drawn {o, u, deg}: what Lock plane copies
+/** The upright grid's heading through b: square to the view across the plate, in whole degrees, 0 along X. */
+function gridHeading(b) {
+  const n = viewer.camera.position.clone().sub(b);
+  n.z = 0;
+  if (n.lengthSq() < 1e-9) n.set(0, -1, 0);
+  return ((Math.round((Math.atan2(n.x, -n.y) * 180) / Math.PI) % 360) + 360) % 360;
+}
+function frameGrid(q) {
+  if (!drawing || drawing.tool !== 'frame' || frame.plate) { viewer.setRefGrid(null); return; }
+  const drop = q && Math.abs(q[2]) > 1e-6 ? new Vector3(...q) : null;
+  // every raised point's stem to the plate, with a foot, so up reads as up and across as across
+  const stems = frame.verts.filter(v => v[2] > 1e-6);
+  // locked: the grid stays where the lock put it, so the plane points land on is the one on screen.
+  // Free: it turns with the view in whole degrees, 0 square to the plate (running along X).
+  const L = frame.lock;
+  const b = L ? L.o : frame.cur != null ? new Vector3(...frame.verts[frame.cur]) : viewer.controls.target.clone();
+  const deg = L ? L.deg : gridHeading(b);
+  const a = (deg * Math.PI) / 180, u = new Vector3(Math.cos(a), Math.sin(a), 0);
+  const o = new Vector3(b.x, b.y, 0);
+  shownGrid = { o, u, deg };
+  viewer.setRefGrid({ o, u, v: new Vector3(0, 0, 1), half: 100, v0: 0, v1: 150, step: 10, vPlate: 0, gauge: { r: 30, deg }, drop, stems });
+  if (gridAngle) gridAngle.textContent = `${deg}°`;
+}
+/** The frame on screen, with the stretch a click would add, or the loop being picked. With gone
+ *  (from frameGone), what a Delete click would take is left out, so it vanishes under the pointer. */
+function showFrame(e, gone = null) {
+  if (!path3dOn) { viewer.setFrame({}); viewer.setRefGrid(null); return; }   // 3D path off: the frame out of sight
+  const V = frame.verts;
+  const segs = frame.edges.filter((_, k) => !gone?.edges.has(k)).flatMap(([a, b]) => [...V[a], ...V[b]]);
+  let q = null;
+  if (e && frame.mode === 'draw') {
+    const i = e.shiftKey ? -1 : frameNear(e, 8, frame.cur ?? -1);
+    q = i >= 0 ? V[i] : framePoint(e);
+    if (q && frame.cur != null) segs.push(...V[frame.cur], ...q);
+    if (q) status(`X ${q[0].toFixed(2)}   Y ${q[1].toFixed(2)}   Z ${q[2].toFixed(2)}${i >= 0 ? '   (joins this point)' : ''}`);
+  }
+  frameGrid(q);
+  for (let k = 1; k < frame.faceCur.length; k++) segs.push(...V[frame.faceCur[k - 1]], ...V[frame.faceCur[k]]);
+  // stems: every raised point, and the one a click would make, down to the plate
+  const keep = V.filter((_, i) => !gone?.verts.has(i));
+  const stems = [...keep, ...(q ? [q] : [])].filter(v => v[2] > 1e-6);
+  viewer.setFrame({ segs, pts: keep.flat(), faces: frameTris(frame.faces.filter((_, k) => !gone?.faces.has(k))), open: frame.open.flatMap(([a, b]) => [...V[a], ...V[b]]), stems });
+}
+function buildFrame() {
+  if (!frame.faces.length) { status('Make solid: fill some faces first (Faces, F: click a loop\'s corners).'); return; }
+  // a closed body: every edge of the faces shared by exactly two of them
+  const use = new Map();
+  for (const f of frame.faces) for (let k = 0; k < f.length; k++) {
+    const a = f[k], b = f[(k + 1) % f.length], key = a < b ? `${a},${b}` : `${b},${a}`;
+    use.set(key, (use.get(key) || 0) + 1);
+  }
+  const open = [...use].filter(([, c]) => c !== 2).map(([key]) => key.split(',').map(Number));
+  if (open.length) {
+    frame.open = open; showFrame(null);
+    status(`Not closed: ${open.length} edge${open.length > 1 ? 's are' : ' is'} on ${open.length > 1 ? 'one face each' : 'one face'} (marked in yellow). Fill the faces that close ${open.length > 1 ? 'them' : 'it'}.`, true);
+    return;
+  }
+  const r = repair(Float32Array.from(frameTris(frame.faces)));
+  const rep = report(r.tris);
+  if (!rep.watertight) { status(`The faces do not make a closed solid: ${describe(rep)}.`, true); return; }
+  // the part's middle in X and Y, its floor at its lowest point
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, z0 = Infinity;
+  const t = r.tris;
+  for (let i = 0; i < t.length; i += 3) { x0 = Math.min(x0, t[i]); x1 = Math.max(x1, t[i]); y0 = Math.min(y0, t[i + 1]); y1 = Math.max(y1, t[i + 1]); z0 = Math.min(z0, t[i + 2]); }
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, local = new Float32Array(t.length);
+  for (let i = 0; i < t.length; i += 3) { local[i] = t[i] - cx; local[i + 1] = t[i + 1] - cy; local[i + 2] = t[i + 2] - z0; }
+  // the part keeps its frame (in its own frame, from its placement), so it can be edited and grown
+  // later; the frame stays here too, and Make solid again updates the same part
+  const xform = { pos: [cx, cy, z0].map(v => +v.toFixed(6)), rot: [0, 0, 0], scale: [1, 1, 1] };
+  const kept = { verts: frame.verts.map(([x, y, z]) => [+(x - xform.pos[0]).toFixed(6), +(y - xform.pos[1]).toFixed(6), +(z - xform.pos[2]).toFixed(6)]), edges: frame.edges, faces: frame.faces };
+  const blob = doc.addBlob(local), nf = frame.faces.length, again = frame.partId && doc.top(frame.partId);
+  let id = frame.partId;
+  if (again) doc.update([id], `Make solid again: ${again.name}`, q => { q.blob = blob; q.xform = xform; q.frame = kept; });   // its steps run on the new shape
+  else id = doc.add({ kind: 'mesh', blob, name: doc.nameFor('frame'), xform, frame: kept }, 'Make solid from the 3D frame');
+  frame.partId = id; frame.open = [];
+  showFrame(null); renderPathFly();
+  setSel([id]);
+  status(`${again ? 'Updated' : 'Made'} ${doc.top(id).name} from ${nf} faces: ${(rep.volume / 1000).toFixed(2)} cm3. Keep adding; Make solid again updates it, Clear frame starts a new one.`);
+}
+/** The one selected part, if it was made from a 3D frame and is not the frame being edited now. */
+function frameToEdit() {
+  const p = path3dOn && sel.length === 1 ? doc.top(sel[0]) : null;
+  return p?.frame && frame.partId !== p.id ? p : null;
+}
+/** A part made from a 3D frame: its frame back in Path, where the part is now, to carry on. */
+function editFrame(p) {
+  if (!p?.frame || !path3dOn) return;
+  const M = matrix(p.xform);
+  if (!drawing) startPath();
+  frameSave();   // U brings back the frame that was in hand
+  Object.assign(frame, {
+    verts: p.frame.verts.map(v => { const w = new Vector3(...v).applyMatrix4(M); return [w.x, w.y, w.z].map(t => +t.toFixed(6)); }),
+    edges: p.frame.edges.map(e => [...e]), faces: p.frame.faces.map(f => [...f]),
+    cur: null, faceCur: [], open: [], mode: 'draw', partId: p.id,
+  });
+  if (drawing.tool !== 'frame') setPathTool('frame');   // (3 again would switch it off)
+  else { showFrame(null); renderPathFly(); }
+  status(`Editing ${p.name}'s frame: add to it, then Make solid (B) updates ${p.name}.`);
+}
+// the view hands left clicks and moves to this while a drawing tool is picked; with Pointer it only
+// offers frame points to grab (a press anywhere else selects and moves parts as usual)
+const grabbing = { grab: e => frameGrab(e), drag: e => frameDrag(e), drop: e => frameDrop(e),
+  hover: e => { viewer.renderer.domElement.style.cursor = path3dOn && drawing &&(drawing.tool === 'pointer' || drawing.tool === 'frame') && frameNear(e) >= 0 ? 'grab' : ''; } };
+const drawTool = { ...grabbing, click: e => pathClick(e), move: e => { if (!drawing) return; if (drawing.tool === 'frame') showFrame(e); else if (drawing.tool === 'erase') eraseMove(e); else showDraft(pathPoint(e)); } };
+const pointerTool = { ...grabbing };
+function startPath() {
+  cancelPlace(); cancelStep();
+  if (measureOn) setMeasure(false);
+  if (fsnap) endFaceSnap();
+  drawing = { tool: 'line', plane: null, pts: [], mark: null };
+  viewer.drawTool = drawTool;
+  viewer.floor = true;   // zooming in stops above the build plate while drawing
+  dropHint.style.display = 'none';
+  pathBtn.classList.add('go');
+  renderPathFly();
+  status('Path, line: ' + PATH_HINT.line);
+}
+function stopPath() {
+  drawing = null; viewer.drawTool = null; viewer.setDraft([]);
+  viewer.floor = false;
+  frame.cur = null; frame.faceCur = [];
+  viewer.setFrame({});   // the frame is kept; it shows again with the 3D frame tool
+  viewer.setRefGrid(null);
+  pathFly.style.display = 'none';
+  placePathFly();   // an open color list moves back against the panel
+  pathBtn.classList.remove('go');
+  dropHint.style.display = doc.parts.length ? 'none' : '';
+}
+function setPathTool(t) {
+  if (!drawing) return;
+  // a line or arc carries on as an arc or a line. Any other tool sets the piece under way aside,
+  // unfinished, and picking its tool again brings it back as it was (it used to be finished: 3 in
+  // the middle of a line made a part of it).
+  const kind = x => (x === 'line' || x === 'arc' ? 'line' : x);
+  const d = drawing;
+  // 3 is a switch: on, into space; again, back to the flat tool it came from. One shape: a flat line
+  // under way joins the frame as a strand and the frame carries on from its last point; back to flat,
+  // the line starts at the frame's last point, level, and joins the frame again on the next 3.
+  let toFlat = false;
+  if (t === 'frame' && d.tool === 'frame') { t = d.flat || 'line'; toFlat = true; }
+  else if (t === 'frame') {
+    d.flat = d.tool === 'pointer' ? 'line' : d.tool;
+    if ((d.tool === 'line' || d.tool === 'arc') && d.plane && d.pts.length) {
+      frameSave();
+      const ids = d.pts.map(q => {
+        const w = fromPlane(d.plane, q), p = [w.x, w.y, w.z].map(v => +v.toFixed(6));
+        const i = frame.verts.findIndex(v => Math.hypot(v[0] - p[0], v[1] - p[1], v[2] - p[2]) < 1e-4);
+        if (i >= 0) return i;
+        frame.verts.push(p); return frame.verts.length - 1;
+      });
+      for (let k = 1; k < ids.length; k++) {
+        const a = ids[k - 1], b = ids[k];
+        if (a !== b && !frame.edges.some(([x, y]) => (x === a && y === b) || (x === b && y === a))) frame.edges.push([a, b]);
+      }
+      frame.cur = ids[ids.length - 1]; frame.plate = false; frame.open = [];
+      d.pts = []; d.plane = null; d.mark = null;
+    }
+  }
+  let kept = '';
+  if (kind(t) !== kind(d.tool) && (d.pts.length || d.mark)) {
+    d.parked = { tool: d.tool, pts: d.pts, plane: d.plane, mark: d.mark };
+    d.pts = []; d.plane = null;
+    kept = ` The ${d.parked.tool === 'rect' ? 'rectangle' : d.parked.tool} under way is kept: ${PATH_TOOLS.find(x => x[0] === d.parked.tool)[2]} brings it back.`;
+  }
+  d.mark = null;
+  if (d.parked && kind(d.parked.tool) === kind(t) && !d.pts.length) {
+    Object.assign(d, { pts: d.parked.pts, plane: d.parked.plane, mark: t === d.parked.tool ? d.parked.mark : null });
+    d.parked = null;
+  }
+  if (toFlat && (t === 'line' || t === 'arc') && !d.pts.length && frame.cur != null) {
+    const c = frame.verts[frame.cur];
+    d.plane = { o: new Vector3(...c), n: new Vector3(0, 0, 1), u: new Vector3(1, 0, 0), v: new Vector3(0, 1, 0), rot: [0, 0, 0] };
+    d.pts = [[0, 0]];
+    frame.cur = null;   // the frame's strand carries on in the flat line
+  }
+  // Delete: nothing selected, so the stretch under the pointer is the only thing lit
+  if (t === 'erase' && d.tool !== 'erase') { eraseLog = []; if (sel.length) setSel([]); }
+  d.tool = t;
+  viewer.drawTool = t === 'pointer' ? pointerTool : drawTool;
+  renderPathFly();
+  // Pointer: the frame stays in sight, to come back to and carry on
+  if (t === 'pointer') { viewer.setDraft([]); frame.cur = null; frame.faceCur = []; showFrame(null); viewer.setRefGrid(null); status('Pointer: ' + PATH_HINT.pointer + kept); return; }
+  if (t === 'frame') { viewer.setDraft([]); showFrame(null); status('3D frame: ' + FRAME_HINT[frame.mode] + kept); return; }
+  showFrame(null); viewer.setRefGrid(null);   // the frame stays in sight: the flat line is part of it
+  showDraft(null);
+  status(`Path, ${PATH_TOOLS.find(x => x[0] === t)[1].toLowerCase()}: ${PATH_HINT[t]}${kept}`);
+}
+/** The Path list in its place (against the panel, or beside the parts list while that is open),
+ *  and an open color list beside it. */
+function placePathFly() {
+  if (drawing) placeFlyout(pathFly, pathBtn.getClientRects().length ? pathBtn : null);
+  if (colorFor) placeFlyout(colorFly, colorFor.anchor);
+}
+function renderPathFly() {
+  const tool = drawing.tool;
+  const tb = ([t, label, key]) => {
+    const b = button(label, () => setPathTool(t), { small: true, title: `${label} (${key})` });
+    b.append(h('span', { class: 'mkey' }, key));
+    if (t === tool) b.classList.add('go');
+    return b;
+  };
+  const head = h('h3', {}, 'Path', h('span', { class: 'grow' }), button('Close', () => { stopPath(); status('Path closed.'); }, { small: true, title: 'Esc with nothing being drawn' }));
+  // every action shows its key on the button, as the tools do
+  const kb = (label, key, fn, title) => { const b = button(label, fn, { small: true, title: `${title} (${key})` }); b.append(h('span', { class: 'mkey' }, key)); return b; };
+  // a made frame part selected (Pointer, then a click on it): its frame back for editing, from here
+  const ef = frameToEdit();
+  const editRow = ef ? [h('div', { class: 'pathtools' }, kb(`Edit frame: ${ef.name}`, 'E', () => editFrame(ef), 'Its 3D frame back to change: drag points, add to it, then Make solid updates the part'))]
+    : path3dOn && doc.parts.some(p => p.frame) && !frame.partId ? [h('div', { class: 'note' }, 'To change a made frame: Pointer (V), click the part, then E.')] : [];
+  if (tool === 'frame') {
+    const draw = kb('Draw', 'D', () => setFrameMode('draw'), 'Lay down points and edges'), faces = kb('Faces', 'F', () => setFrameMode('faces'), 'Fill loops of the frame');
+    (frame.mode === 'draw' ? draw : faces).classList.add('go');
+    pathFly.replaceChildren(head,
+      h('div', { class: 'pathtools' }, ...PATH_TOOLS.filter(x => path3dOn || x[0] !== 'frame').map(tb)),
+      h('div', { class: 'pathtools' }, draw, faces),
+      ...editRow,
+      h('div', { class: 'keyhint' }, h('b', {}, 'Shift'), ' hold: mouse up or down lifts or lowers the point; over a point, straight up from it'),
+      h('div', { class: 'note' }, 'Upright grid: ', gridAngle = h('span', { class: 'mono' }, '0°'), frame.lock ? ' from X, locked: points stay on it' : ' from X (turns with the view, whole degrees)'),
+      ui.tip(ui.check('Draw on the plate  (G)', frame.plate, v => setFramePlate(v)), 'Every point on the build plate: a flat outline'),
+      ui.tip(ui.check('Lock plane  (Space)', !!frame.lock, () => toggleFrameLock()), 'Turn the view until the upright grid faces the way you want, then lock: points stay on that grid, up and across, through the last point'),
+      h('div', { class: 'note' }, FRAME_HINT[frame.mode]),
+      h('div', { class: 'note' }, `${frame.verts.length} points, ${frame.edges.length} edges, ${frame.faces.length} faces`),
+      h('div', { class: 'pathtools' },
+        kb('Make solid', 'B', () => buildFrame(), 'The filled faces as a part, if they close up'),
+        frame.mode === 'draw' ? kb('End strand', 'N', () => frameEnter(), 'The next click starts a new strand') : kb('Fill loop', 'N', () => frameEnter(), 'Fill the loop picked so far'),
+        kb('Undo last step', 'U', () => frameBack(), 'Take back the last point, edge or face'),
+        button('Clear frame', () => { frameSave(); Object.assign(frame, { verts: [], edges: [], cur: null, faces: [], faceCur: [], open: [], partId: null }); showFrame(null); renderPathFly(); status('Frame cleared: the next Make solid makes a new part. U brings it back.'); }, { small: true, title: 'Start a new design (U brings this one back)' })));
+    placePathFly();
+    return;
+  }
+  if (tool === 'erase') {
+    pathFly.replaceChildren(head, h('div', { class: 'pathtools' }, ...PATH_TOOLS.filter(x => path3dOn || x[0] !== 'frame').map(tb)), h('div', { class: 'note' }, PATH_HINT.erase),
+      h('div', { class: 'pathtools' }, kb('Undo last delete', 'U', () => eraseUndo(), 'Bring back what the last click deleted')));
+    placePathFly();
+    return;
+  }
+  if (tool === 'pointer') {
+    pathFly.replaceChildren(head, h('div', { class: 'pathtools' }, ...PATH_TOOLS.filter(x => path3dOn || x[0] !== 'frame').map(tb)), ...editRow, h('div', { class: 'note' }, PATH_HINT.pointer));
+    placePathFly();
+    return;
+  }
+  pathFly.replaceChildren(head,
+    h('div', { class: 'pathtools' }, ...PATH_TOOLS.filter(x => path3dOn || x[0] !== 'frame').map(tb)),
+    h('div', { class: 'note' }, PATH_HINT[tool]),
+    ...(tool === 'line' || tool === 'arc' ? [h('div', { class: 'keyhint' }, h('b', {}, 'Shift'), ' hold: turn in 15 degree steps')] : []),
+    ui.numfield('Line width', pathSet.width, 'mm', v => { pathSet.width = v; }, { min: 0.01, step: 0.5, lazy: true, digits: 3 }),
+    ui.numfield('Height', pathSet.h, 'mm', v => { pathSet.h = v; }, { min: 0.01, step: 0.5, lazy: true, digits: 3 }),
+    h('div', { class: 'pathtools' },
+      kb('Finish line', 'F', () => finishPiece(false), 'End the line at its last point, open'),
+      kb('Undo last point', 'U', () => pointBack(), 'Take the last point clicked back off the line'),
+      kb('Cancel line', 'X', () => clearPiece(true), 'Drop the line being drawn')));
+  placePathFly();
+}
+function setFrameMode(m) {
+  frame.mode = m; frame.faceCur = []; frame.cur = null;
+  renderPathFly(); showFrame(null);
+  status('3D frame: ' + FRAME_HINT[m]);
+}
+function clearPiece(say) { if (!drawing) return; drawing.pts = []; drawing.plane = null; drawing.mark = null; showDraft(null); if (say) status('Path: piece dropped. ' + PATH_HINT[drawing.tool]); }
+function pointBack() {
+  if (!drawing) return;
+  if (drawing.mark) drawing.mark = null; else drawing.pts.pop();
+  if (!drawing.pts.length && !drawing.mark) drawing.plane = null;
+  showDraft(null);
+}
+/** Within 0.01 mm of a true arc: the most a step may turn on a circle of radius r. */
+const arcStep = r => 2 * Math.acos(Math.max(-1, 1 - Math.min(0.01 / Math.max(r, 1e-9), 1)));
+/** An arc from p0 through p1 to p2 (in the plane), as points from p0 to p2; a straight line if they line up. */
+function arcPoints(p0, p1, p2) {
+  const [ax, ay] = p0, [bx, by] = p1, [cx, cy] = p2;
+  const d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));
+  if (Math.abs(d) < 1e-9) return [p0, p2];
+  const a2 = ax * ax + ay * ay, b2 = bx * bx + by * by, c2 = cx * cx + cy * cy;
+  const ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d, uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d;
+  const r = Math.hypot(ax - ux, ay - uy), T = 2 * Math.PI, norm = x => ((x % T) + T) % T;
+  const t0 = Math.atan2(ay - uy, ax - ux), t1 = Math.atan2(by - uy, bx - ux), t2 = Math.atan2(cy - uy, cx - ux);
+  const sweep = norm(t1 - t0) < norm(t2 - t0) ? norm(t2 - t0) : -norm(t0 - t2);   // the way round that passes p1
+  const n = Math.min(720, Math.max(2, Math.ceil(Math.abs(sweep) / arcStep(r))));
+  const out = [p0];
+  for (let i = 1; i < n; i++) { const t = t0 + (sweep * i) / n; out.push([+(ux + r * Math.cos(t)).toFixed(6), +(uy + r * Math.sin(t)).toFixed(6)]); }
+  out.push(p2);
+  return out;
+}
+const circlePoints = ([cx, cy], r) => {
+  const n = Math.min(720, Math.max(24, Math.ceil((2 * Math.PI) / arcStep(r))));
+  return Array.from({ length: n }, (_, i) => [+(cx + r * Math.cos((2 * Math.PI * i) / n)).toFixed(6), +(cy + r * Math.sin((2 * Math.PI * i) / n)).toFixed(6)]);
+};
+const rectPoints = ([a0, b0], [a1, b1]) => [[a0, b0], [a1, b0], [a1, b1], [a0, b1]];
+const onScreen = p => {
+  const s = p.clone().project(viewer.camera), r = viewer.renderer.domElement.getBoundingClientRect();
+  return [(s.x + 1) / 2 * r.width + r.left, (1 - s.y) / 2 * r.height + r.top];
+};
+const fromPlane = (P, [a, b]) => P.o.clone().addScaledVector(P.u, a).addScaledVector(P.v, b);
+/** Where the pointer lands on the path's plane, in its own coordinates, on the move step. */
+function pathPoint(e) {
+  let P = drawing.plane;
+  if (!P) {
+    const hit = viewer.placeHit(e);
+    if (!hit) return null;
+    return [onLattice(hit.point.x), onLattice(hit.point.y)].map(v => +v.toFixed(6));   // the level plane's o is over the origin
+  }
+  const p = new Vector3();
+  if (!viewer.ray(e).ray.intersectPlane(new Plane().setFromNormalAndCoplanarPoint(P.n, P.o), p)) return null;
+  p.sub(P.o);
+  let a = p.dot(P.u), b = p.dot(P.v);
+  const last = drawing.pts[drawing.pts.length - 1];
+  if (e.shiftKey && last) {
+    // the stretch from the last point turns in 15 degree steps
+    const ang = Math.round(Math.atan2(b - last[1], a - last[0]) / (Math.PI / 12)) * (Math.PI / 12), len = Math.hypot(a - last[0], b - last[1]);
+    a = last[0] + Math.cos(ang) * len; b = last[1] + Math.sin(ang) * len;
+  } else { a = Math.round(a / moveStep) * moveStep; b = Math.round(b / moveStep) * moveStep; }
+  return [+a.toFixed(6), +b.toFixed(6)];
+}
+/** The piece being drawn, with the pointer's point as the next click would make it. */
+function showDraft(cursor) {
+  const d = drawing;
+  if (!d?.plane) { viewer.setDraft([]); return; }
+  let pts = d.pts.slice();
+  if (cursor) {
+    if (d.tool === 'line') pts.push(cursor);
+    else if (d.tool === 'arc') pts = d.mark && pts.length ? [...pts, ...arcPoints(pts[pts.length - 1], d.mark, cursor).slice(1)] : [...pts, ...(d.mark ? [d.mark] : []), cursor];
+    else if (d.tool === 'circle' && d.mark) { const c = circlePoints(d.mark, Math.hypot(cursor[0] - d.mark[0], cursor[1] - d.mark[1])); pts = [...c, c[0]]; }
+    else if (d.tool === 'rect' && d.mark) { const c = rectPoints(d.mark, cursor); pts = [...c, c[0]]; }
+    else pts.push(cursor);
+  } else if (d.mark) pts.push(d.mark);
+  viewer.setDraft(pts.map(q => fromPlane(d.plane, q)));
+}
+/** The first click of a piece: its level plane (at the plate or the spot clicked) and the point in it. */
+function planeFrom(e) {
+  // always level: at the plate, or at the height of the spot clicked on a part (top, side or
+  // slope). A plane tilted to the face clicked stood on edge to the view on a side face, and the
+  // mouse met it far off: points flew away. X and Y only from here; the height stays.
+  const hit = viewer.placeHit(e);
+  if (!hit) return null;
+  const z = hit.normal ? +hit.point.z.toFixed(6) : 0;
+  drawing.plane = { o: new Vector3(0, 0, z), n: new Vector3(0, 0, 1), u: new Vector3(1, 0, 0), v: new Vector3(0, 1, 0), rot: [0, 0, 0] };
+  return pathPoint(e);
+}
+function pathClick(e) {
+  const d = drawing;
+  if (d.tool === 'frame') { frameClick(e); return; }
+  if (d.tool === 'erase') { eraseClick(e); return; }
+  const q = d.plane ? pathPoint(e) : planeFrom(e);
+  if (!q) return;
+  const near = (p, px) => { const [x, y] = onScreen(fromPlane(d.plane, p)); return Math.hypot(x - e.clientX, y - e.clientY) <= px; };
+  const same = (p, r) => p && p[0] === r[0] && p[1] === r[1];
+  if (d.tool === 'line') {
+    if (d.pts.length >= 3 && near(d.pts[0], 8)) { finishPiece(true); return; }
+    if (d.pts.length >= 2 && near(d.pts[d.pts.length - 1], 4)) { finishPiece(false); return; }
+    if (!same(d.pts[d.pts.length - 1], q)) d.pts.push(q);
+  } else if (d.tool === 'arc') {
+    if (!d.pts.length) d.pts.push(q);
+    else if (!d.mark) { if (!same(d.pts[d.pts.length - 1], q)) d.mark = q; }
+    else {
+      const end = d.pts.length >= 2 && near(d.pts[0], 8) ? d.pts[0] : q;   // an arc ending on the first point closes the loop
+      d.pts.push(...arcPoints(d.pts[d.pts.length - 1], d.mark, end).slice(1));
+      d.mark = null;
+      if (end === d.pts[0] && d.pts.length >= 4) { d.pts.pop(); finishPiece(true); return; }
+    }
+  } else if (!d.mark) d.mark = q;
+  else {
+    const m = d.mark;
+    d.mark = null;
+    if (d.tool === 'circle') { const r = Math.hypot(q[0] - m[0], q[1] - m[1]); if (r > 0) commitPiece(circlePoints(m, r), true); }
+    else if (q[0] !== m[0] && q[1] !== m[1]) commitPiece(rectPoints(m, q), true);
+    return;
+  }
+  showDraft(null);
+}
+function finishPiece(closed) {
+  const d = drawing;
+  if (!d) return;
+  if (d.pts.length < 2) { status('Path: a line needs two points or more.'); return; }
+  commitPiece(d.pts, closed);
+}
+/** A finished piece as a part; Path stays open for the next. */
+function commitPiece(pts2, closed) {
+  const d = drawing;
+  // the part's middle is the middle of its points; the points are kept from there
+  const c = pts2.reduce((s, q) => [s[0] + q[0] / pts2.length, s[1] + q[1] / pts2.length], [0, 0]);
+  const pts = pts2.map(q => [+(q[0] - c[0]).toFixed(6), +(q[1] - c[1]).toFixed(6)]);
+  const at = fromPlane(d.plane, c);
+  const id = doc.add({ kind: 'path', params: { pts, width: pathSet.width, h: pathSet.h, closed, fill: 'line', sides: 32 },
+    xform: { pos: [at.x, at.y, at.z].map(v => +v.toFixed(6)), rot: d.plane.rot, scale: [1, 1, 1] } });
+  clearPiece(false);
+  setSel([id]);
+  status(`Added ${doc.top(id).name}${closed ? ', closed: its inside is set in the panel' : ''}. Draw the next piece, or Esc to close Path.`);
+}
+
+// ---- Delete (Path, key K): click a stretch of a drawn line, or a 3D frame point or edge, to remove it --
+// Hovering shows what would go: a frame point or edge vanishes under the pointer; a line's stretch
+// is drawn over in the selection color. A stretch out of an open line splits it in two parts (an
+// end stretch shortens it); out of a closed loop, the loop opens there. A frame point takes its
+// edges and faces with it; an edge takes the faces along it; a point left with no edge goes too.
+// U takes back the last delete (frame deletes on the frame's own undo, line deletes on the model's).
+let eraseLog = [];   // 'frame' or 'doc' per delete, newest last, for U
+/** Distance in pixels from the pointer to the screen segment A B. */
+function segDist(e, [ax, ay], [bx, by]) {
+  const dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy;
+  const t = L ? Math.max(0, Math.min(1, ((e.clientX - ax) * dx + (e.clientY - ay) * dy) / L)) : 0;
+  return Math.hypot(ax + t * dx - e.clientX, ay + t * dy - e.clientY);
+}
+/** What a Delete click here would take: {kind: 'vert' | 'edge', i} on the frame, {kind: 'path', id, k} a line's stretch k, or null. */
+function eraseTarget(e) {
+  if (path3dOn && frame.verts.length) {
+    const i = frameNear(e, 8);
+    if (i >= 0) return { kind: 'vert', i };
+    let best = -1, bd = 8;
+    frame.edges.forEach(([a, b], k) => { const d = segDist(e, onScreen(new Vector3(...frame.verts[a])), onScreen(new Vector3(...frame.verts[b]))); if (d <= bd) { bd = d; best = k; } });
+    if (best >= 0) return { kind: 'edge', i: best };
+  }
+  // a line's stretch: within 8 px of its middle line, or anywhere on a line wider than that on screen
+  let hit = null, bd = Infinity;
+  for (const p of doc.parts) {
+    if (p.kind !== 'path' || p.hidden || !p.params?.pts?.length) continue;
+    const M = matrix(p.xform), z = (p.params.h || 0) / 2;
+    const W = p.params.pts.map(([x, y]) => new Vector3(x, y, z).applyMatrix4(M));
+    const tol = Math.max(8, (p.params.width || 0) / 2 / viewer.pxAt(W[0]));
+    const S = W.map(onScreen), runs = p.params.closed ? S.length : S.length - 1;
+    for (let k = 0; k < runs; k++) {
+      const d = segDist(e, S[k], S[(k + 1) % S.length]);
+      if (d <= tol && d < bd) { bd = d; hit = { kind: 'path', id: p.id, k, a: W[k], b: W[(k + 1) % W.length] }; }
+    }
+  }
+  return hit;
+}
+/** The frame points, edges and faces (index sets) a frame delete takes. */
+function frameGone(t) {
+  const verts = new Set(), edges = new Set(), faces = new Set();
+  if (t.kind === 'vert') {
+    verts.add(t.i);
+    frame.edges.forEach(([a, b], k) => { if (a === t.i || b === t.i) edges.add(k); });
+    frame.faces.forEach((f, k) => { if (f.includes(t.i)) faces.add(k); });
+  } else {
+    const [a, b] = frame.edges[t.i];
+    edges.add(t.i);
+    frame.faces.forEach((f, k) => { for (let j = 0; j < f.length; j++) { const x = f[j], y = f[(j + 1) % f.length]; if ((x === a && y === b) || (x === b && y === a)) faces.add(k); } });
+  }
+  // a point left with no edge and in no face goes too
+  const ends = new Set([...edges].flatMap(k => frame.edges[k]));
+  for (const v of ends) if (!verts.has(v) && !frame.edges.some((ed, k) => !edges.has(k) && ed.includes(v)) && !frame.faces.some((f, k) => !faces.has(k) && f.includes(v))) verts.add(v);
+  return { verts, edges, faces };
+}
+function eraseMove(e) {
+  const t = eraseTarget(e);
+  viewer.setDraft(t?.kind === 'path' ? [t.a, t.b] : []);
+  showFrame(null, t && t.kind !== 'path' ? frameGone(t) : null);
+  if (!t) { status('Delete: ' + PATH_HINT.erase); return; }
+  status(t.kind === 'path' ? `Click deletes this stretch of ${doc.top(t.id).name}.` : `Click deletes this frame ${t.kind === 'vert' ? 'point' : 'edge'}.`);
+}
+function eraseClick(e) {
+  const t = eraseTarget(e);
+  if (!t) { status('Delete: nothing here. ' + PATH_HINT.erase); return; }
+  if (t.kind === 'path') {
+    const p = doc.top(t.id);
+    if (p.locked) { status(`${p.name} is locked (Ctrl+L).`); return; }
+    const P = p.params.pts, k = t.k;
+    let msg;
+    doc.commit(`Delete a stretch of ${p.name}`, parts => {
+      const i = parts.findIndex(q => q.id === p.id), q = parts[i];
+      if (q.params.closed) { q.params.pts = [...P.slice(k + 1), ...P.slice(0, k + 1)]; q.params.closed = false; msg = `${p.name} opened there`; return; }
+      const pieces = [P.slice(0, k + 1), P.slice(k + 1)].filter(x => x.length >= 2);
+      if (!pieces.length) { parts.splice(i, 1); msg = `${p.name} deleted (that was its last stretch)`; return; }
+      q.params.pts = pieces[0];
+      if (pieces.length === 1) { msg = `${p.name} shortened`; return; }
+      const c = structuredClone(q);
+      Object.assign(c, { id: doc.newId(), name: doc.nameFor('path') });
+      c.params.pts = pieces[1];
+      parts.splice(i + 1, 0, c);
+      msg = `${p.name} split in two: ${p.name} and ${c.name}`;
+    });
+    eraseLog.push('doc');
+    viewer.setDraft([]);
+    status(`${msg}. U takes it back.`);
+    return;
+  }
+  const g = frameGone(t);
+  frameSave();
+  const map = new Map();
+  frame.verts.forEach((v, i) => { if (!g.verts.has(i)) map.set(i, map.size); });
+  frame.verts = frame.verts.filter((_, i) => !g.verts.has(i));
+  frame.edges = frame.edges.filter((_, k) => !g.edges.has(k)).map(ed => ed.map(v => map.get(v)));
+  frame.faces = frame.faces.filter((_, k) => !g.faces.has(k)).map(f => f.map(v => map.get(v)));
+  frame.cur = frame.cur != null && map.has(frame.cur) ? map.get(frame.cur) : null;
+  frame.faceCur = []; frame.open = [];
+  eraseLog.push('frame');
+  showFrame(null); renderPathFly();
+  const said = [[g.verts.size, 'point'], [g.edges.size, 'edge'], [g.faces.size, 'face']].filter(([n]) => n).map(([n, w]) => `${n} ${w}${n === 1 ? '' : 's'}`);
+  status(`Deleted from the frame: ${said.join(', ')}. U takes it back.`);
+}
+function eraseUndo() {
+  const k = eraseLog.pop();
+  if (!k) { status('Delete: nothing to take back.'); return; }
+  if (k === 'frame') frameBack(); else docUndo();
+  status('Delete taken back.');
+}
+
+function measureClick(e) {
+  const s = viewer.snapPoint(e);
+  if (!s) return;
+  if (mPts.length >= 2) mPts = [];
+  mPts.push(s.point);
+  viewer.setMeasure(mPts);
+  measureText();
+}
 // move step: one column of buttons, bottom left
 const moveBtns = MOVE_STEPS.map(v => h('button', { type: 'button', class: 'movestep' + (v === moveStep ? ' on' : ''),
   title: `Move in ${v} mm steps (arrows, drag)`, onclick: () => setMoveStep(v) }, ...(v < 0.1 ? ['0.', h('br'), v.toFixed(2).slice(2)] : [v.toFixed(1)])));
@@ -616,7 +1448,11 @@ const statusMsg = h('span', { class: 'msg' }, 'Ready.');
 // busy: a barber pole beside the status that keeps moving while any work runs. It is a CSS
 // animation, drawn by the browser's compositor, so it keeps moving even when the page itself is
 // held up by a long job (the moment something stops it is the moment to worry).
-const footer = h('footer', {}, statusMsg, h('span', { class: 'busybar', role: 'progressbar', 'aria-label': 'Working' }, h('i')));
+// a line of text, not a button: quiet, at the bottom right of the view, while there is work and
+// nothing keeps it; a click starts saving (the same as Save as project)
+const autosaveNote = h('a', { class: 'autosave-note', href: '#', style: 'display:none', title: 'Name the project; every step is then kept as you work' }, 'Auto save is turned off, click here to enable');
+autosaveNote.addEventListener('click', e => { e.preventDefault(); pickProjectFolder(); });
+const footer = h('footer', {}, statusMsg, h('span', { class: 'busybar', role: 'progressbar', 'aria-label': 'Working' }, h('i')), autosaveNote);
 let busyTimer = 0;
 function busyCheck() {
   let on = /\.\.\.$/.test(statusMsg.textContent);
@@ -626,7 +1462,7 @@ function busyCheck() {
   else footer.classList.remove('busy');
 }
 const fatal = h('div', { class: 'fatal', style: 'display:none' });
-view.append(header, dropHint, views, cut, moveCol, pastBanner, fatal, footer);
+view.append(header, dropHint, views, cut, moveCol, pastBanner, measureBox, snapBar, fatal, keyStrip, footer, selCount);
 app.append(view, aside);
 function showFatal(text) {
   fatal.replaceChildren(h('p', { class: 'err' }, text), button('Reload', () => location.reload()));
@@ -642,6 +1478,22 @@ catch (e) {
   throw e;
 }
 view.viewer = viewer;   // for the browser test
+
+// ---- stereo (View > Stereo): for phone goggles and headsets; see stereo.js -------------------------
+const stereo = new Stereo(app, viewer);
+folders.recall('stereo').then(v => { if (v && typeof v === 'object') stereo.set = { ...stereo.set, ...v }; }).catch(() => {});
+function setStereo(on) {
+  stereo.enable(on);
+  status(on ? `Stereo on: windows at ${STEREO_SCALES.find(s => s[0] === stereo.set.scale)[0]} scale. View > Stereo settings to change it.` : 'Stereo off.');
+}
+function showStereoPop() {
+  const save = () => { folders.remember('stereo', stereo.set).catch(() => {}); if (stereo.on) stereo.layout(); };
+  gridPop.style.display = '';
+  gridPop.replaceChildren(h('h3', {}, 'Stereo'),
+    ui.tip(h('div', { class: 'sub' }, 'Scale windows'), 'Whole fractions of half the screen, in device pixels: the picture is drawn at exactly that size'),
+    seg(STEREO_SCALES.map(([k]) => [k, k]), stereo.set.scale, v => { stereo.set.scale = v; save(); }),
+    h('div', { class: 'row' }, button(stereo.on ? 'Stereo off' : 'Stereo on', () => { setStereo(!stereo.on); showStereoPop(); }, { small: true }), button('Done', () => showGridPop(false), { small: true })));
+}
 let lostTimer = 0;
 viewer.onContext = ok => {
   clearTimeout(lostTimer);
@@ -659,7 +1511,10 @@ function status(text, error = false) {
 }
 
 // ---- document changes ----------------------------------------------------------------------
+let rewound = [];   // Ctrl+Z steps back with parts selected: [{ steps: [{ i: history index, ids }] }], newest last (see undo)
 function bindDoc() {
+  rewound = [];
+  doc.on(rewoundFollows);
   doc.on(ev => {
     if (ev.type === 'cmd' && !project && !projectAsked) { projectAsked = true; setTimeout(askForFolder, 0); }
     refresh();
@@ -685,8 +1540,10 @@ async function refresh() {
   for (const p of need) building.add(p.id);
   // moves, hides and holes show at once; while anything builds, parts it replaces stay shown
   // (striped, not pickable) so nothing blinks out and nothing busy gets clicked
-  const busyNow = () => [...building, ...(building.size ? viewer.kept : [])];
+  const busyNow = () => [...building, ...(building.size ? viewer.kept : [])].filter(id => !holdView.has(id));
+  for (const id of holdView.keys()) if (!need.some(p => p.id === id)) holdView.delete(id);
   viewer.sync(doc.parts, meshes, building.size > 0);
+  for (const [id, x] of holdView) viewer.setXform(id, x);
   viewer.setBusy(busyNow());
   busyCheck();
   if (!need.length) return;
@@ -700,6 +1557,7 @@ async function refresh() {
       status(`${p.name}: ${shortErr(err.message)}`, true);
     }
     building.delete(p.id);
+    holdView.delete(p.id);
   }
   for (const id of [...meshes.keys()]) if (!doc.find(id)) meshes.delete(id);
   void my;
@@ -710,6 +1568,10 @@ async function refresh() {
   renderInspector();
 }
 const building = new Set();   // part ids whose mesh is being built
+// A part resized by a handle or a typed size: until its new mesh is built, its old mesh stays
+// shown the way the drag left it (stretched), not striped. Shown at its new settings, the old mesh
+// sprang back to its old size for a moment and then jumped to the new one.
+const holdView = new Map();   // part id -> placement of its current mesh that looks like the new form
 const ready = new Map();      // shape key -> {tris, volume}: a mesh built ahead (the placing ghost)
 /** An error short enough for one line; an internal one names what to try. */
 function shortErr(msg) {
@@ -726,14 +1588,17 @@ async function sendBlobs() {
   }
 }
 
+let alignLit = false;   // L: the Align buttons lit (several parts selected); a new selection puts it out
 function setSel(ids) {
+  if (ids.length !== sel.length || ids.some((id, i) => id !== sel[i])) alignLit = false;
   endPast(false);
   if (facePlane && !(ids.length === 1 && ids[0] === facePlane.id)) facePlane = null;
   sel = ids.filter(id => doc.top(id));
   viewer.select(sel);
-  viewer.solo(pastHideOthers && sel.length === 1 ? sel[0] : null);   // Hide other parts follows the selection
+  viewer.solo(pastHideOthers && sel.length ? [...sel] : null);   // Hide other parts follows the selection
   renderParts();
   renderInspector();
+  if (drawing && (drawing.tool === 'frame' || drawing.tool === 'pointer')) renderPathFly();   // Edit frame follows the selection
 }
 
 // ---- shapes and parts list -------------------------------------------------------------------
@@ -759,6 +1624,7 @@ function defaultSpot() {
 }
 async function addShape(kind) {
   cancelPlace();
+  if (drawing) stopPath();   // a shape picked while drawing: Path closes (the 3D frame is kept)
   const params = { ...SHAPES[kind] };
   const my = placing = { kind, params, xform: null, face: null };
   try {
@@ -872,11 +1738,51 @@ function renamePart(p, row) {
 // ---- inspector ----------------------------------------------------------------------------
 let inspectorFor = null;
 // never rebuild under a field being typed in; catch up when focus leaves
-inspector.addEventListener('focusout', () => setTimeout(() => { if (document.activeElement?.tagName !== 'INPUT' || !inspector.contains(document.activeElement)) renderInspector(); }, 0));
+const catchUp = () => { if (document.activeElement?.tagName !== 'INPUT' || !inspector.contains(document.activeElement)) renderInspector(); };
+inspector.addEventListener('focusout', () => setTimeout(catchUp, 0));
+// nor under a press in the panel or the color list: pressing a button moves focus (and a typed
+// value is saved on leaving its field), and a rebuild between press and release swapped the
+// button for a copy, so the browser dropped the click and every button needed two. A rebuild
+// asked for meanwhile runs once the click is done.
+// The same for a step's notes: a preview landing mid-press added a line above Apply, Apply
+// moved down and the release fell on the card behind it.
+let pressing = false, owed = false;
+const held = [];
+const whenFree = fn => (pressing ? held.push(fn) : fn());
+addEventListener('pointerdown', e => { pressing = !!e.target.closest?.('aside, .flyout'); }, true);
+const released = () => {
+  pressing = false;
+  if (owed || held.length) setTimeout(() => { for (const fn of held.splice(0)) fn(); if (owed) { owed = false; catchUp(); } }, 0);
+};
+addEventListener('pointerup', released, true);
+addEventListener('pointercancel', released, true);
 /** live: the part as a handle drag would leave it, shown while dragging (with `view`, the
  *  placement of its current mesh that looks the same). */
+let histBlock = null;   // the History block last shown {id, nodes}: kept in place during a drag
+/** Three number boxes on one row under a title (Size, Position, Rotation, Scale); extra sits at the
+ *  title's right end. Each box keeps its full name (read aloud, and found by it) and shows a letter. */
+const trio = (title, fields, extra) => h('div', { class: 'trio' }, h('div', { class: 'sub' }, h('span', {}, title), ...(extra ? [extra] : [])), h('div', { class: 'trio-row' }, ...fields));
+const mini = (el, letter) => { el.classList.add('mini'); el.querySelector('label').dataset.s = letter; el.title ||= el.querySelector('label').textContent; return el; };
+/** Handles on the one selected part, or on the box around several (none locked, no step or
+ *  history view under way). */
+function showHandles() {
+  const free = sel.length && !step && !past && sel.every(id => doc.top(id) && !doc.top(id).locked);
+  if (free && sel.length === 1) viewer.setHandles(sel[0]);
+  else if (free) viewer.setHandleBox([...sel]);
+  else viewer.setHandles(null);
+}
+/** The Rotation heading is the rings' switch: lit while they show, until pressed again. */
+function ringsButton() {
+  const b = button('Rotation Rings', () => { rotateOn = !rotateOn; viewer.setRings(rotateOn); b.classList.toggle('go', rotateOn); },
+    { small: true, title: 'Shows the turn rings until pressed again. Holding R shows them too. The boxes below turn the part about its middle, in degrees.' });
+  if (rotateOn) b.classList.add('go');
+  return b;
+}
 function renderInspector(live = null) {
-  viewer.setHandles(sel.length === 1 && !step && !past && !doc.top(sel[0])?.locked ? sel[0] : null);
+  if (pressing && !live) { owed = true; return; }
+  showHandles();
+  selCount.textContent = `${sel.length} parts selected`;
+  selCount.style.display = sel.length > 1 ? '' : 'none';
   const hide = !sel.length;
   shapeOpts.style.display = hide || curTab !== 'shapes' ? 'none' : '';
   partOpts.style.display = hide || curTab !== 'parts' ? 'none' : '';
@@ -888,15 +1794,31 @@ function renderInspector(live = null) {
   if (sel.length > 1) {
     const first = doc.top(sel[0]);
     const ungroupBtn = button('Ungroup', () => ungroupSel(), { title: 'Ctrl+Shift+G' });
-    inspector.replaceChildren(h('div', { class: 'sub' }, `${sel.length} parts selected`),
-      colorPicker(sel.every(id => doc.top(id)?.color === first?.color) ? first?.color : '', hex => {
+    const holes = sel.map(id => !!doc.top(id)?.hole);
+    inspector.replaceChildren(
+      // Solid / Hole for them all (lit on neither while they differ)
+      seg([['solid', 'Solid'], ['hole', 'Hole']], holes.every(x => x) ? 'hole' : holes.every(x => !x) ? 'solid' : null, v => {
         const ids = editable();
-        if (ids.length) doc.update(ids, `Color ${ids.length} parts: ${colorName(hex)}`, q => { if (hex) q.color = hex; else delete q.color; });
+        if (ids.length) doc.update(ids, `${ids.length} parts to ${v}`, q => { q.hole = v === 'hole'; });
       }),
+      // Color and Hide other parts on one row, as for one part
+      h('div', { class: 'pairrow' }, colorPicker(sel.every(id => doc.top(id)?.color === first?.color) ? first?.color : '', hex => {
+        const ids = editable();
+        if (ids.length) doc.update(ids, `Color ${ids.length} parts: ${colorName(hex)}`, q => { if (hex) q.color = hex; else delete q.color; q.hole = false; });
+      }), ui.tip(ui.check('Hide other parts', pastHideOthers, v => { pastHideOthers = v; viewer.solo(v ? [...sel] : null); }), 'Show only these parts in the view while they are selected')),
+      // the box around them all: typed sizes stretch them as the handles do; the rings turn them together
+      ...(() => {
+        const b = viewer.bounds(sel);
+        if (!b) return [];
+        const sz = b.getSize(new Vector3()).toArray();
+        return [trio('Size, mm', ['Width', 'Depth', 'Height'].map((label, i) => mini(ui.numfield(label, +sz[i].toFixed(4), '', v => { if (v > 0) multiSize(i, v); },
+          { min: 0.0001, step: moveStep, lazy: true, digits: 4 }), 'WDH'[i]))), h('div', { class: 'sub' }, ringsButton())];
+      })(),
       h('div', { class: 'row' }, button('Group', () => groupSel(), { title: 'Ctrl+G' }), button('Intersect', () => groupSel('intersect'), { title: 'Ctrl+I' }), ungroupBtn),
       h('div', { class: 'sub' }, 'Align'),
       ...['X', 'Y', 'Z'].map((a, i) => h('div', { class: 'row align' }, h('span', { class: 'axis' }, a),
-        ...[['Min', 0], ['Mid', 0.5], ['Max', 1]].map(([l, f]) => button(l, () => alignSel(i, f), { small: true })))),
+        ...ALIGN_WORDS[i].map((l, j) => { const b = button(l, () => alignSel(i, j / 2), { small: true, title: `Line the parts up on their ${l.toLowerCase()} ${l === 'Middle' ? 'in ' + a : 'sides'}` }); if (alignLit) b.classList.add('go'); return b; }))),
+      button('Snap faces...', () => startFaceSnap(), { small: true, title: 'Click a face to snap to, then a face on another part: that part turns and moves onto the first face' }),
       h('div', { class: 'row' }, button('Delete', () => deleteSel(), { title: 'Delete' })),
       selTotals());
     ungroupBtn.disabled = !sel.some(id => doc.top(id)?.kind === 'group');
@@ -911,49 +1833,88 @@ function renderInspector(live = null) {
   const body = [
     seg([['solid', 'Solid'], ['hole', 'Hole']], p.hole ? 'hole' : 'solid', v => upd(v === 'hole' ? `${p.name} to hole` : `${p.name} to solid`, q => { q.hole = v === 'hole'; })),
   ];
-  if (!p.hole) body.push(colorPicker(p.color, hex => upd(`${p.name} color: ${colorName(hex)}`, q => { if (hex) q.color = hex; else delete q.color; })));
-  // every part, shape or import, history or not
-  body.push(ui.tip(ui.check('Hide other parts', pastHideOthers, v => { pastHideOthers = v; viewer.solo(v ? p.id : null); if (past) scrubTo(past.k); }), 'Show only this part in the view while it is selected'));
+  // color and Hide other parts share a row (the panel scrolled on a scaled 1080p screen)
+  const hideOthers = ui.tip(ui.check('Hide other parts', pastHideOthers, v => { pastHideOthers = v; viewer.solo(v ? p.id : null); if (past) scrubTo(past.k); }), 'Show only this part in the view while it is selected');
+  // Color always shows; picking one on a hole makes it solid in the same step (no extra click)
+  body.push(h('div', { class: 'pairrow' }, colorPicker(p.color, hex => upd(`${p.name} color: ${colorName(hex)}${p.hole ? ', solid' : ''}`, q => { if (hex) q.color = hex; else delete q.color; q.hole = false; })), hideOthers));
   // history of this part: each form it has had (shape, sizes, steps, turn, scale), not where
   // it has been. Dragging shows that form where the part is now; letting go sets it (one undo
   // step). Later forms stay in the list, so it can be stepped forward again.
+  // during a drag the block is not rebuilt, but the one already shown stays in place, so nothing
+  // below it jumps up and back (it used to drop out for the whole drag)
   const hist = live ? null : doc.formHistory(p.id);
-  if (hist && hist.length > 1) {
+  if (live && histBlock?.id === p.id) body.push(...histBlock.nodes);
+  else if (hist && hist.length > 1) {
     const n = hist.length, key = formKey(p);
     let cur = n;
     for (let i = n - 1; i >= 0; i--) if (hist[i].key === key) { cur = i + 1; break; }
     const at = past?.id === p.id ? past.k : cur;
     const label = h('div', { class: 'note' });
     pastUi = { label, n, hist, cur, id: p.id };
-    body.push(h('div', { class: 'sub' }, 'History'),
+    const nodes = [h('div', { class: 'sub' }, 'History'),
       ui.slider(`Step (of ${n})`, at, '', { min: 1, max: n, step: 1 }, k => scrubTo(k), k => setPast(k)),
-      label);
+      label];
+    histBlock = { id: p.id, nodes };
+    body.push(...nodes);
     pastLabel(at);
-  } else pastUi = null;
+  } else { pastUi = null; histBlock = null; }
+  // a closed path's inside, the bucket: the line alone, filled, or filled and cut through as a hole
+  if (p.kind === 'path' && p.params.closed) {
+    const inside = seg([['line', 'Hollow'], ['fill', 'Fill'], ['clear', 'Clear']], p.hole ? 'clear' : p.params.fill === 'fill' ? 'fill' : 'line',
+      v => upd(`${p.name} inside: ${v === 'line' ? 'hollow' : v}`, q => { q.params.fill = v === 'line' ? 'line' : 'fill'; q.hole = v === 'clear'; }));
+    // once the part has steps (a hollow, an edge shape), the line alone is not a choice: grayed out, saying why
+    if (p.ops?.length) {
+      // (grayed, not disabled: a disabled button shows no tip; a click says why in the status line)
+      const b = inside.querySelector('button[data-v="line"]'), why = `Hollow is off: the part has ${p.ops.length} step${p.ops.length > 1 ? 's' : ''}; remove them under Steps to pick the line alone.`;
+      b.classList.add('off'); b.setAttribute('aria-disabled', 'true');
+      b.addEventListener('click', e => { e.stopImmediatePropagation(); status(why); }, true);   // capture: before the button's own pick
+      ui.tip(b, why);
+    }
+    body.push(ui.tip(h('div', { class: 'sub' }, 'Inside'), 'Hollow: the line alone. Fill: the inside solid. Clear: the inside cuts a hole in what it sits on (in a group).'), inside);
+  }
   if (p.params) {
+    const pf = (k, v, facets, unit = facets ? '' : 'mm') => ui.numfield(LABELS[k] || k, v, unit, nv => upd(`${p.name}: ${(LABELS[k] || k).toLowerCase()} ${nv}`, q => { q.params[k] = facets ? Math.round(nv) : nv; }),
+      { min: facets ? 3 : k === 'd2' || k === 'd1' ? 0 : 0.0001, step: facets ? 4 : 1, lazy: true, digits: facets ? 0 : 4 });
+    // a box's three sizes on one row
+    const xyz = ['x', 'y', 'z'].every(k => typeof p.params[k] === 'number');
+    if (xyz) body.push(trio('Size, mm', ['x', 'y', 'z'].map((k, i) => mini(pf(k, p.params[k], false, ''), 'WDH'[i]))));
     for (const [k, v] of Object.entries(p.params)) {
-      const facets = k === 'sides' || k === 'tubeSides';
-      body.push(ui.numfield(LABELS[k] || k, v, facets ? '' : 'mm', nv => upd(`${p.name}: ${(LABELS[k] || k).toLowerCase()} ${nv}`, q => { q.params[k] = facets ? Math.round(nv) : nv; }),
-        { min: facets ? 3 : k === 'd2' || k === 'd1' ? 0 : 0.0001, step: facets ? 4 : 1, lazy: true, digits: facets ? 0 : 4 }));
+      if (typeof v !== 'number') continue;   // a path's points, closed and inside are not sizes
+      if (p.kind === 'path' && k === 'h') continue;   // its height is under Size, with width and depth
+      if (xyz && (k === 'x' || k === 'y' || k === 'z')) continue;
+      body.push(pf(k, v, k === 'sides' || k === 'tubeSides'));
     }
   }
   if (p.kind === 'group') body.push(h('div', { class: 'row' }, button('Ungroup', () => ungroupSel(), { title: 'Ctrl+Shift+G' })));
-  // where the part really is: its middle in X and Y, its lowest point in Z (0 = on the plate)
+  if (p.frame && path3dOn) body.push(h('div', { class: 'row' }, button('Edit frame', () => editFrame(doc.top(p.id)), { title: 'Its 3D frame back in Path, where the part is now: add to it, then Make solid updates this part' })));
+  // typed sizes for imports, groups and paths (shapes have their own sizes above): the same change
+  // as the size handles, kept exactly as typed
+  if (m && (p.kind === 'mesh' || p.kind === 'group' || p.kind === 'path')) {
+    const lb = boundsOf(m), sc = (p.view || p.xform).scale;
+    body.push(trio('Size, mm', ['Width', 'Depth', 'Height'].map((label, i) => {
+      const cur = (lb.hi[i] - lb.lo[i]) * Math.abs(sc[i]);
+      return mini(ui.numfield(label, +cur.toFixed(4), '', v => {
+        const q0 = doc.top(p.id);
+        if (!q0 || !(v > 0) || !(cur > 0)) return;
+        const r = handleResult({ p: q0, lb }, { kind: 'size', axis: i, side: 0, exact: true, size: v }, {});
+        if (!r.same && !lock) holdView.set(p.id, r.view);
+        if (!r.same) upd(r.label, q => { q.params = r.part.params; q.xform = r.part.xform; });
+      }, { min: 0.0001, step: moveStep, lazy: true, digits: 4 }), 'WDH'[i]);
+    })));
+  }
+  body.push(trio(ringsButton(), ['X', 'Y', 'Z'].map((a, i) => mini(ui.numfield(a, p.xform.rot[i], '',
+    v => upd(`Rotate ${p.name}`, q => { const r = [...q.xform.rot]; r[i] = v; q.xform = rotated(q, r); }), { step: 15, lazy: true, digits: 3 }), a))));
+  if (!p.params || p.xform.scale.some(v => v !== 1)) {
+    body.push(trio('Scale, %', ['X', 'Y', 'Z'].map((a, i) => mini(ui.numfield(a, p.xform.scale[i] * 100, '', v => upd(`Scale ${p.name}`, q => { q.xform.scale[i] = v / 100; q.xform = snapped(q, q.xform); }), { min: 0.0001, step: 10, lazy: true, digits: 4 }), a))));
+  }
+  // where the part really is: its middle in X and Y, its lowest point in Z (0 = on the plate).
+  // Last of the boxes: the least used.
   const wb = worldBox(p, p.view || p.xform);
-  body.push(h('div', { class: 'sub' }, 'Position'));
   if (wb) {
     const at = [(wb.min.x + wb.max.x) / 2, (wb.min.y + wb.max.y) / 2, wb.min.z];
-    [['Center X', 0], ['Center Y', 1], ['Bottom Z', 2]].forEach(([label, i]) => body.push(ui.numfield(label, +at[i].toFixed(4), 'mm',
-      v => upd(`Move ${p.name}`, q => { q.xform.pos[i] = +(q.xform.pos[i] + v - at[i]).toFixed(6); q.xform = snapped(q, q.xform); }), { step: moveStep, lazy: true, digits: 3 })));
-  }
-  body.push(ui.tip(h('div', { class: 'sub' }, 'Rotation'), 'Turns about the middle of the part'));
-  const rot = ui.tip(ui.check('Rings', rotateOn, v => { rotateOn = v; viewer.setRings(v); }), 'Shows the turn rings. Holding R shows them too.');
-  body.push(rot);
-  ['X', 'Y', 'Z'].forEach((a, i) => body.push(ui.numfield(a, p.xform.rot[i], 'deg',
-    v => upd(`Rotate ${p.name}`, q => { const r = [...q.xform.rot]; r[i] = v; q.xform = rotated(q, r); }), { step: 15, lazy: true, digits: 3 })));
-  if (!p.params || p.xform.scale.some(v => v !== 1)) {
-    body.push(h('div', { class: 'sub' }, 'Scale'));
-    ['X', 'Y', 'Z'].forEach((a, i) => body.push(ui.numfield(a, p.xform.scale[i] * 100, '%', v => upd(`Scale ${p.name}`, q => { q.xform.scale[i] = v / 100; q.xform = snapped(q, q.xform); }), { min: 0.0001, step: 10, lazy: true, digits: 4 })));
+    body.push(ui.tip(trio('Position, mm', [['Center X', 0], ['Center Y', 1], ['Bottom Z', 2]].map(([label, i]) => mini(ui.numfield(label, +at[i].toFixed(4), '',
+      v => upd(`Move ${p.name}`, q => { q.xform.pos[i] = +(q.xform.pos[i] + v - at[i]).toFixed(6); q.xform = snapped(q, q.xform); }), { step: moveStep, lazy: true, digits: 3 }), 'XYZ'[i]))),
+      'X and Y: the middle of the part. Z: its lowest point (0 is on the plate).'));
   }
   // steps
   body.push(h('div', { class: 'sub' }, 'Steps'));
@@ -966,7 +1927,7 @@ function renderInspector(live = null) {
   const open = m?.open;
   if (open) body.push(ui.tip(h('div', { class: 'note' }, 'Not closed'), 'It still moves, groups and exports as it is; cutting, hollowing and edge shaping close it for that step. Repair closes it for good.'));
   const usable = tools.filter(t => !t.appliesTo || t.appliesTo(p));
-  body.push(h('div', { class: 'row wrap' }, ...usable.map(t => button(t.title, () => startStep(t, p.id), { small: true, title: t.blurb }))));
+  body.push(h('div', { class: 'row wrap steps' }, ...usable.map(t => button(t.title, () => startStep(t, p.id), { small: true, title: t.blurb }))));
   // a tool's settings open right here, under the button that opened them
   if (step && step.partId === p.id) body.push(stepCard);
   if (lock) body.push(h('div', { class: 'note' }, 'Locked: Ctrl+L to unlock.'));
@@ -974,12 +1935,22 @@ function renderInspector(live = null) {
   const info = h('div', { class: 'infobox' });
   if (m) {
     const b = wb;
-    info.append(kv([['size', b ? `${mm(b.max.x - b.min.x)} x ${mm(b.max.y - b.min.y)} x ${mm(b.max.z - b.min.z)}` : '-'], ['volume', `${(m.volume / 1000).toFixed(2)} cm3`], ['triangles', count(m.tris.length / 9)], ['STL', `about ${sizeText(stlBytes(m.tris.length / 9))}`]]));
+    info.append(dimsBox(b && b.getSize(new Vector3())), kv([['volume', `${(realVolume(p, m) / 1000).toFixed(2)} cm3`], ['triangles', count(m.tris.length / 9)], ['STL', `about ${sizeText(stlBytes(m.tris.length / 9))}`]]));
   }
   info.append(h('div', { class: 'row' }, button('Export this part...', () => { expWhat = 'sel'; exportDialog(); }, { small: true, title: 'Export only this part (Ctrl+E exports with the last choices)' })));
   body.push(info);
   inspector.replaceChildren(...body);
 }
+
+/** The outer size, large, in a frame with its caption on the line (a group box, not a button:
+ *  no fill, no hover, the frame in the border gray). s: Vector3 or null while building. */
+function dimsBox(s) {
+  return h('div', { class: 'dims' }, h('span', { class: 'cap' }, 'Outer size, mm'),
+    ...['X', 'Y', 'Z'].map(a => h('div', { class: 'd' }, h('b', {}, s ? mm(s[a.toLowerCase()]) : '-'), h('span', {}, a))));
+}
+
+/** A part's volume at its real size: its mesh is in its own frame, before scale. */
+const realVolume = (p, m) => (m.volume || 0) * Math.abs(((p.view || p.xform)?.scale || [1, 1, 1]).reduce((a, b) => a * b, 1));
 
 /** Several parts selected: their numbers added up (size is the box round them all). */
 function selTotals() {
@@ -989,14 +1960,15 @@ function selTotals() {
     const p = doc.top(id), m = meshes.get(id);
     if (!p || !m) { all = false; continue; }
     tris += m.tris.length / 9;
-    vol += m.volume || 0;
+    vol += realVolume(p, m);
     const wb = worldBox(p);
     if (wb) b.union(wb);
   }
   const s = b.isEmpty() ? null : b.getSize(new Vector3());
-  return h('div', { class: 'infobox' }, h('div', { class: 'sub' }, all ? 'Together' : 'Together (some still building)'),
-    h('div', { class: 'row' }, button('Export these parts...', () => { expWhat = 'sel'; exportDialog(); }, { small: true, title: 'Export only the selected parts, joined or one file each' })),
-    kv([['size', s ? `${mm(s.x)} x ${mm(s.y)} x ${mm(s.z)}` : '-'], ['volume', `${(vol / 1000).toFixed(2)} cm3`], ['triangles', count(tris)], ['STL', `about ${sizeText(stlBytes(tris))}`]]));
+  // the same order as one part's: the outer size, the totals, Export at the foot
+  return h('div', { class: 'infobox' }, ...(all ? [] : [h('div', { class: 'sub' }, 'Some still building')]),
+    dimsBox(s), kv([['volume', `${(vol / 1000).toFixed(2)} cm3`], ['triangles', count(tris)], ['STL', `about ${sizeText(stlBytes(tris))}`]]),
+    h('div', { class: 'row' }, button('Export these parts...', () => { expWhat = 'sel'; exportDialog(); }, { small: true, title: 'Export only the selected parts, joined or one file each' })));
 }
 
 // ---- history view ---------------------------------------------------------------------------
@@ -1073,7 +2045,7 @@ async function setPast(k) {
 function endPast(redraw = true) {
   if (!past && !viewer.past) return;
   past = null;
-  viewer.setHandles(sel.length === 1 && !step && !doc.top(sel[0])?.locked ? sel[0] : null);
+  showHandles();
   pastSeq++;
   pastBanner.style.display = 'none';
   viewer.showPast(null);
@@ -1091,7 +2063,13 @@ viewer.onNeedEdges = (id, key, tris) => {
   pool.call('io', { type: 'edges', tris: copy, angle: 40 }, [copy.buffer]).then(r => viewer.setEdges(id, key, r.segs)).catch(() => {});
 };
 viewer.onPick = (id, face, e) => {
+  if (measureOn) { measureClick(e); return; }
+  if (fsnap && !fsnap.b) { faceSnapPick(id, face); return; }
   if (id && viewer.busy?.has(id)) { status('Still building: wait until the stripes go.'); return; }
+  // while a step works, its picks stay as they were sent: a click must not add or drop a face
+  // under a running job (dragging the part still moves it)
+  const picking = step && id === step.partId && (step.tool.needsFace || step.tool.pickWalls?.(step.params));
+  if (picking && step.running) { status(`${step.tool.title} is working: the picked faces are locked until it finishes.`); return; }
   if (step && id === step.partId && step.tool.needsFace) { pickStepFace(face); return; }
   if (step && id === step.partId && step.tool.pickWalls?.(step.params)) { pickWall(face); return; }
   if (!id) { if (!e.shiftKey) setSel([]); return; }
@@ -1114,13 +2092,13 @@ viewer.onDragStart = (id, e) => {
 };
 viewer.onDrag = (dx, dy, e) => {
   if (!drag) return;
-  const snap = e.shiftKey ? 0.1 : moveStep;
+  const snap = moveStep;
   drag.d = [+(Math.round(dx / snap) * snap).toFixed(6), +(Math.round(dy / snap) * snap).toFixed(6)];
   for (const id of drag.ids) {
     const p = doc.top(id), s = drag.start.get(id);
     viewer.setXform(id, { ...p.xform, pos: [s[0] + drag.d[0], s[1] + drag.d[1], s[2]] });
   }
-  status(`Move ${mm(drag.d[0])}, ${mm(drag.d[1])} mm${e.shiftKey || moveStep <= 0.1 ? '' : '  (Shift: 0.1 mm steps)'}`);
+  status(`Move ${mm(drag.d[0])}, ${mm(drag.d[1])} mm`);
 };
 viewer.onDragEnd = () => {
   if (!drag) return;
@@ -1134,12 +2112,15 @@ viewer.onDragEnd = () => {
 
 // ---- handles: size, lift, turn -----------------------------------------------------------------
 // Size: the opposite side stays where it is and the new size snaps to the move step; Shift
-// sizes every axis together. Round shapes stay round; a shape's own sizes change where they
-// can (a box keeps scale 1), otherwise its scale. Lift: Z in move steps. Turn: about the
-// part's middle, 15 degree steps (Shift: 1). The panel follows live; one undo step on release.
-const ROUND = { cylinder: 1, tube: 1, cone: 1, torus: 1 };
+// sizes every axis together. A side handle pulls that side only, round shapes too (a circle
+// pulled one way goes oval, by its scale); a shape's own sizes change where they can (a box
+// keeps scale 1, a cylinder pulled up keeps its height), otherwise its scale. Lift: Z in move
+// steps. Turn: about the part's middle, 15 degree steps (Shift: 1). The panel follows live; one
+// undo step on release.
+const ROUND = { cylinder: 1, tube: 1, cone: 1, torus: 1, sphere: 1 };
 let hdrag = null;
 viewer.onHandle = (phase, h, e) => {
+  if (sel.length > 1) { multiHandle(phase, h, e); return phase === 'start' ? !!hdrag : undefined; }
   if (phase === 'start') {
     const p = doc.top(sel[0]), m = p && meshes.get(p.id);
     if (!p || !m || p.locked || step || past) return false;
@@ -1159,8 +2140,105 @@ viewer.onHandle = (phase, h, e) => {
   if (!ringsHeld) viewer.setRings(rotateOn);   // R let go during the turn
   const r = d.next;
   if (!r || r.same) { viewer.sync(doc.parts, meshes); renderInspector(); return; }
+  holdView.set(d.p.id, r.view);
   doc.update([d.p.id], r.label, q => { q.params = r.part.params; q.xform = r.part.xform; });
 };
+
+// Several parts selected: the handles sit on the box around them all and work on them as if
+// grouped, without grouping. Size: the box stretches from its far side (Shift: all ways), each
+// part sized along its own axis nearest the pulled one and moved so it keeps its place in the
+// box. Lift: all up together. Turn: all about the box's middle. One undo step on release.
+/** The world box of a part's own box corners, as placed by xform (as the view's box is). */
+function cornerBox(lb, xform) {
+  const M = matrix(xform), b = new Box3();
+  for (const x of [lb.lo[0], lb.hi[0]]) for (const y of [lb.lo[1], lb.hi[1]]) for (const z of [lb.lo[2], lb.hi[2]]) b.expandByPoint(new Vector3(x, y, z).applyMatrix4(M));
+  return b;
+}
+function multiHandle(phase, h, e) {
+  if (phase === 'start') {
+    const ps = sel.map(id => doc.top(id));
+    if (step || past || ps.some(p => !p || p.locked || !meshes.get(p.id))) { hdrag = null; return; }
+    const lbs = new Map(ps.map(p => [p.id, localBounds(meshes.get(p.id).tris)]));
+    const box = new Box3();
+    for (const p of ps) box.union(cornerBox(lbs.get(p.id), p.xform));
+    hdrag = { multi: true, ps: ps.map(p => structuredClone(p)), lbs, box, next: null };
+    return;
+  }
+  if (!hdrag?.multi) return;
+  if (phase === 'move') {
+    const r = multiResult(hdrag, h, e);
+    hdrag.next = r;
+    for (const [id, x] of r.out) viewer.setXform(id, x.view);
+    status(r.text);
+    return;
+  }
+  const d = hdrag; hdrag = null;
+  if (!ringsHeld) viewer.setRings(rotateOn);
+  multiCommit(d.next);
+}
+function multiCommit(r) {
+  if (!r || r.same) { viewer.sync(doc.parts, meshes); renderInspector(); return; }
+  for (const [id, x] of r.out) holdView.set(id, x.view);
+  doc.update([...r.out.keys()], r.label, q => { const x = r.out.get(q.id); q.params = x.part.params; q.xform = x.part.xform; });
+}
+/** A typed size for several parts: the same stretch as a handle, from the middle and the bottom. */
+function multiSize(axis, size) {
+  multiHandle('start');
+  const d = hdrag;
+  hdrag = null;
+  if (d) multiCommit(multiResult(d, { kind: 'size', axis, side: 0, exact: true, size }, { shiftKey: false }));
+}
+function multiResult(d, h, e) {
+  const { box: B, ps, lbs } = d, out = new Map(), n = ps.length;
+  const lo = B.min.toArray(), hi = B.max.toArray(), mid = B.getCenter(new Vector3());
+  const move = (x, dv) => { for (const xf of [x.part.xform, x.view]) xf.pos = xf.pos.map((v, j) => +(v + dv[j]).toFixed(6)); };
+  if (h.kind === 'lift') {
+    const dz = +(Math.round(h.delta / moveStep) * moveStep).toFixed(6);
+    for (const p of ps) { const part = structuredClone(p); part.xform.pos[2] = +(part.xform.pos[2] + dz).toFixed(6); out.set(p.id, { part, view: part.xform }); }
+    return { out, same: !dz, label: `Lift ${n} parts ${mm(dz)} mm`, text: `Lift ${mm(dz)} mm (${n} parts)` };
+  }
+  if (h.kind === 'rot') {
+    const st = e.shiftKey ? 1 : 15, deg = Math.round(h.deg / st) * st;   // (as handleResult rounds it)
+    for (const p of ps) {
+      const r = handleResult({ p, lb: lbs.get(p.id) }, h, e), lb = lbs.get(p.id);
+      // each part turns about its own middle (handleResult), then its middle swings about the box's
+      const c = new Vector3((lb.lo[0] + lb.hi[0]) / 2, (lb.lo[1] + lb.hi[1]) / 2, (lb.lo[2] + lb.hi[2]) / 2).applyMatrix4(matrix(p.xform));
+      const qa = new Quaternion().setFromAxisAngle(new Vector3().setComponent(h.axis, 1), (deg * Math.PI) / 180);
+      const to = c.clone().sub(mid).applyQuaternion(qa).add(mid);
+      const x = { part: r.part, view: r.part.xform };
+      move(x, to.sub(c).toArray());
+      out.set(p.id, x);
+    }
+    return { out, same: !deg, label: `Turn ${n} parts ${deg} deg about ${'XYZ'[h.axis]}`, text: `Turn ${deg} deg about ${'XYZ'[h.axis]} (${n} parts)${e.shiftKey ? '' : '  (Shift: 1 deg steps)'}` };
+  }
+  // size: the box's new size on the pulled axis, in move steps; the point that stays: the far side
+  // on that axis, the middle across, the bottom in Z (as for one part)
+  const i = h.axis, size0 = hi[i] - lo[i];
+  // pulled back through past the side that stays: they all mirror on that axis (as one part does)
+  const raw = h.exact ? h.size : size0 + h.delta, flip = !h.exact && h.side && raw < 0;
+  const size = h.exact ? h.size : Math.max(moveStep, Math.round(Math.abs(raw) / moveStep) * moveStep);
+  const k = size / size0, f = e.shiftKey ? [k, k, k] : [0, 1, 2].map(j => (j === i ? k : 1));
+  if (flip) f[i] = -f[i];
+  const a = [0, 1, 2].map(j => (j === i && h.side ? (h.side > 0 ? lo[j] : hi[j]) : j < 2 ? mid.getComponent(j) : lo[2]));
+  for (const p of ps) {
+    const lb = lbs.get(p.id), s = p.xform.scale;
+    // the part's own axis that lies nearest the pulled one
+    const R = matrix({ pos: [0, 0, 0], rot: p.xform.rot, scale: [1, 1, 1] }).elements;
+    const jl = [0, 1, 2].reduce((best, j) => (Math.abs(R[j * 4 + i]) > Math.abs(R[best * 4 + i]) ? j : best), 0);
+    const own = (lb.hi[jl] - lb.lo[jl]) * Math.abs(s[jl]);
+    const x = handleResult({ p, lb }, { kind: 'size', axis: jl, side: 0, exact: true, size: own * k }, e);
+    if (flip) for (const xf of [x.part.xform, x.view]) xf.scale = xf.scale.map((v, j) => (j === jl ? -v : v));   // mirrored, as M does
+    // keep its place in the box: its middle across and its bottom in Z scaled from the point that
+    // stays (mirrored in Z, its old top becomes its bottom)
+    const b0 = cornerBox(lb, p.xform), b1 = cornerBox(lb, x.view);
+    const at0 = [(b0.min.x + b0.max.x) / 2, (b0.min.y + b0.max.y) / 2, f[2] < 0 ? b0.max.z : b0.min.z], at1 = [(b1.min.x + b1.max.x) / 2, (b1.min.y + b1.max.y) / 2, b1.min.z];
+    move(x, [0, 1, 2].map(j => a[j] + (at0[j] - a[j]) * f[j] - at1[j]));
+    out.set(p.id, x);
+  }
+  const names = ['Width', 'Depth', 'Height'];
+  return { out, same: !flip && Math.abs(k - 1) < 1e-9, label: `Size ${n} parts: ${e.shiftKey ? 'all' : names[i].toLowerCase()} ${mm(size)} mm${flip ? ', mirrored' : ''}`,
+    text: `${names[i]} ${mm(size)} mm (${n} parts)${flip ? ' (mirrored)' : ''}${e.shiftKey ? ' (all sides together)' : '  (Shift: all sides together)'}` };
+}
 
 function handleResult(d, h, e) {
   const p = d.p, { lo, hi } = d.lb, x0 = p.xform, s = x0.scale;
@@ -1182,23 +2260,40 @@ function handleResult(d, h, e) {
       text: `Turn ${deg} deg about ${'XYZ'[h.axis]}${e.shiftKey ? '' : '  (Shift: 1 deg steps)'}` };
   }
   // size
-  const i = h.axis, size0 = (hi[i] - lo[i]) * s[i];
-  const size = Math.max(moveStep, Math.round((size0 + h.delta) / moveStep) * moveStep);
+  // a typed size (exact) is kept as typed; a drag snaps to the move step
+  const i = h.axis, size0 = (hi[i] - lo[i]) * Math.abs(s[i]);
+  // a handle pulled back through the part past the side that stays: the part mirrors on that axis
+  // (as M does) and keeps stretching out the other way
+  const raw = h.exact ? h.size : size0 + h.delta, flip = !h.exact && h.side && raw < 0;
+  const size = h.exact ? h.size : Math.max(moveStep, Math.round(Math.abs(raw) / moveStep) * moveStep);
   const k = size / size0, f = [1, 1, 1];
-  if (e.shiftKey || p.kind === 'sphere') f.fill(k);
+  if (e.shiftKey) f.fill(k);
   else {
     f[i] = k;
-    if (ROUND[p.kind] && i < 2) f[0] = f[1] = k;
     if (p.kind === 'fillet' && i !== 1) f[0] = f[2] = k;   // its corner stays square
   }
+  if (flip) f[i] = -f[i];
   // the point that must not move: the far side on this axis, the middle across, the bottom in Z
-  const a = [0, 1, 2].map(j => j === i ? (h.side > 0 ? lo[j] : hi[j]) : j < 2 ? (lo[j] + hi[j]) / 2 : lo[2]);
+  // (a typed size, side 0, keeps the middle and the bottom, as the Position fields read)
+  const a = [0, 1, 2].map(j => j === i && h.side ? (h.side > 0 ? lo[j] : hi[j]) : j < 2 ? (lo[j] + hi[j]) / 2 : lo[2]);
   const shift = new Vector3(...a.map((v, j) => s[j] * (f[j] - 1) * v)).applyMatrix4(R);
   const view = { ...x0, pos: [x0.pos[0] - shift.x, x0.pos[1] - shift.y, x0.pos[2] - shift.z].map(v => +v.toFixed(6)), scale: s.map((v, j) => v * f[j]) };
   part.xform = { ...view, scale: [...s] };
-  const P = part.params, mul = (key, j) => { if (P[key] != null) P[key] = +(P[key] * f[j]).toFixed(6); };
+  // a shape's own sizes take the size; a mirror (pulled through) stays in its scale, as M does
+  const P = part.params, mul = (key, j) => { if (P[key] != null) P[key] = +(P[key] * Math.abs(f[j])).toFixed(6); };
   const kind = p.kind;
-  if (kind === 'box' || kind === 'wedge') { mul('x', 0); mul('y', 1); mul('z', 2); }
+  // a round shape pulled out of round (across one way, or a sphere any one way) takes it in its scale
+  const af = f.map(Math.abs);
+  const oval = ROUND[kind] && (af[0] !== af[1] || ((kind === 'sphere' || kind === 'torus') && af[0] !== af[2]));
+  if (flip) part.xform.scale[i] = -part.xform.scale[i];
+  if (oval) part.xform.scale = view.scale.map(v => +v.toFixed(6));
+  else if (kind === 'box' || kind === 'wedge') { mul('x', 0); mul('y', 1); mul('z', 2); }
+  else if (kind === 'path') {
+    // the line keeps its width: the points spread so the outside comes to the size asked
+    const w = P.width, fp = [0, 1].map(j => { const ext = (hi[j] - lo[j]) * Math.abs(s[j]); return af[j] === 1 || ext - w < 1e-9 ? af[j] : (af[j] * ext - w) / (ext - w); });
+    P.pts = P.pts.map(([x, y]) => [+(x * fp[0]).toFixed(6), +(y * fp[1]).toFixed(6)]);
+    mul('h', 2);
+  }
   else if (kind === 'cylinder' || kind === 'tube') { mul('d', 0); mul('h', 2); if (e.shiftKey) mul('wall', 0); }
   else if (kind === 'cone') { mul('d1', 0); mul('d2', 0); mul('h', 2); }
   else if (kind === 'sphere') mul('d', 0);
@@ -1206,8 +2301,8 @@ function handleResult(d, h, e) {
   else if (kind === 'torus' && e.shiftKey) { mul('d', 0); mul('tube', 0); }
   else part.xform.scale = view.scale.map(v => +v.toFixed(6));   // meshes, groups, a torus pulled out of round
   const names = ['Width', 'Depth', 'Height'];
-  return { part, view, same: Math.abs(k - 1) < 1e-9, label: `Size ${p.name}: ${e.shiftKey ? 'all' : names[i].toLowerCase()} ${mm(size)} mm`,
-    text: `${names[i]} ${mm(size)} mm${e.shiftKey ? ' (all sides together)' : '  (Shift: all sides together)'}` };
+  return { part, view, same: !flip && Math.abs(k - 1) < 1e-9, label: `Size ${p.name}: ${e.shiftKey ? 'all' : names[i].toLowerCase()} ${mm(size)} mm${flip ? ', mirrored' : ''}`,
+    text: `${names[i]} ${mm(size)} mm${flip ? ' (mirrored)' : ''}${e.shiftKey ? ' (all sides together)' : '  (Shift: all sides together)'}` };
 }
 
 const editable = () => sel.filter(id => !doc.top(id)?.locked);
@@ -1263,6 +2358,107 @@ function ungroupSel() {
 }
 /** Line the selected parts up on one axis: their low sides (0), middles (0.5) or high sides (1)
  *  to the same side of the box round them all. */
+// ---- snap faces: the second face clicked turns and moves onto the first --------------------------
+// Click a face (its part stays put), then a face on another part: that part turns so the two
+// faces lie against each other, and moves onto the first, centered. A bar under the menus then
+// sets where on the first face it sits: Center, or flush with its Left, Right, Top or Bottom edge
+// as seen on screen. Each placing is one undo step; Esc or Done ends it.
+let fsnap = null;   // { a: face } after the first click; { a, b, moved } once snapped (snapBar is made with measureBox)
+function startFaceSnap() {
+  if (doc.parts.filter(p => !p.hidden).length < 2) { status('Snap faces needs two parts.'); return; }
+  cancelStep(); cancelPlace();
+  if (measureOn) setMeasure(false);
+  if (drawing) stopPath();
+  fsnap = {};
+  snapBar.replaceChildren(h('span', {}, 'Click the face to snap to'));
+  snapBar.style.display = '';
+  status('Snap faces: click the face to snap to (that part stays), then a face on the part to move. Esc ends it.');
+}
+function endFaceSnap() { fsnap = null; snapBar.style.display = 'none'; viewer.setFacePick(null); }
+/** A flat face of a part, in the world: its outward normal, its points and its middle (by area). */
+function worldFace(id, face) {
+  const p = doc.top(id), m = meshes.get(id);
+  if (!p || !m || face < 0) return null;
+  const r = faceRegion(m.tris, face), M = matrix(p.xform), N = new Matrix3().getNormalMatrix(M);
+  const pts = [], c = new Vector3();
+  let area = 0;
+  for (const f of r.tris) {
+    const v = [0, 1, 2].map(k => new Vector3(m.tris[f * 9 + k * 3], m.tris[f * 9 + k * 3 + 1], m.tris[f * 9 + k * 3 + 2]).applyMatrix4(M));
+    const a = v[1].clone().sub(v[0]).cross(v[2].clone().sub(v[0])).length() / 2;
+    c.addScaledVector(v[0].clone().add(v[1]).add(v[2]).divideScalar(3), a); area += a;
+    pts.push(...v);
+  }
+  return { id, n: new Vector3(...r.normal).applyMatrix3(N).normalize(), pts, c: c.divideScalar(area || 1), local: r };
+}
+function faceSnapPick(id, face) {
+  if (!id) return;
+  const F = worldFace(id, face);
+  if (!F) return;
+  if (!fsnap.a) {
+    fsnap.a = F;
+    viewer.setFacePick(id, F.local.tris);
+    snapBar.replaceChildren(h('span', {}, 'Now a face on the part to move'));
+    status('Now click a face on the part to move onto it.');
+    return;
+  }
+  if (id === fsnap.a.id) { status('Pick a face on another part: the first face\'s part stays put.'); return; }
+  if (doc.top(id).locked) { status(`${doc.top(id).name} is locked (Ctrl+L).`); return; }
+  fsnap.b = F;
+  fsnap.base = structuredClone(doc.top(id).xform);
+  placeSnap('center');
+}
+/** Turn the second part so its face lies on the first, then put it at `where` on that face. */
+function placeSnap(where) {
+  const { a, b } = fsnap, p = doc.top(b.id);
+  if (!p) { endFaceSnap(); return; }
+  // turn: the moving face's normal onto the opposite of the first face's, about the face's middle
+  const R = new Quaternion().setFromUnitVectors(b.n, a.n.clone().negate());
+  const turn = q => q.clone().sub(b.c).applyQuaternion(R).add(b.c);
+  const pts = b.pts.map(turn), c = turn(b.c);
+  // in the first face's plane, along the face itself: a world axis lying in it (the face's longest
+  // edge on a slanted face), the one nearest to running across the screen; the screen only says
+  // which way is right and which is up, so Left, Right, Top and Bottom are as seen
+  const scr = viewer.planeAxes(a.n);
+  const inPlane = [new Vector3(1, 0, 0), new Vector3(0, 1, 0), new Vector3(0, 0, 1)].filter(x => Math.abs(x.dot(a.n)) < 1e-6);
+  if (!inPlane.length) {
+    let best = null, bl = 0;
+    for (let i = 0; i < a.pts.length; i += 3) for (let k = 0; k < 3; k++) {
+      const e = a.pts[i + (k + 1) % 3].clone().sub(a.pts[i + k]), l = e.length();
+      if (l > bl) { bl = l; best = e; }
+    }
+    inPlane.push(best.normalize());
+  }
+  const u = inPlane.reduce((m, x) => (Math.abs(x.dot(scr.u)) > Math.abs(m.dot(scr.u)) ? x : m)).clone();
+  if (u.dot(scr.u) < 0) u.negate();
+  const v = a.n.clone().cross(u).normalize();
+  if (v.dot(scr.v) < 0) v.negate();
+  const span = (list, ax) => { let lo = Infinity, hi = -Infinity; for (const q of list) { const s = q.dot(ax); lo = Math.min(lo, s); hi = Math.max(hi, s); } return [lo, hi]; };
+  const [au0, au1] = span(a.pts, u), [av0, av1] = span(a.pts, v), [bu0, bu1] = span(pts, u), [bv0, bv1] = span(pts, v);
+  // across the face: centered, or one edge flush with the same edge of the first face
+  let du = a.c.dot(u) - c.dot(u), dv = a.c.dot(v) - c.dot(v);
+  if (where === 'left') du = au0 - bu0;
+  if (where === 'right') du = au1 - bu1;
+  if (where === 'bottom') dv = av0 - bv0;
+  if (where === 'top') dv = av1 - bv1;
+  // onto the plane: the moved face's plane meets the first face's
+  const dn = a.c.dot(a.n) - c.dot(a.n);
+  const T = u.clone().multiplyScalar(du).addScaledVector(v, dv).addScaledVector(a.n, dn);
+  const x0 = fsnap.base;
+  const q0 = new Quaternion().setFromEuler(new Euler(...x0.rot.map(r => r * Math.PI / 180), 'XYZ'));
+  const e = new Euler().setFromQuaternion(R.clone().multiply(q0), 'XYZ');
+  const pos = turn(new Vector3(...x0.pos)).add(T);
+  doc.update([p.id], `Snap ${p.name} to ${doc.top(a.id)?.name || 'a face'}${where === 'center' ? '' : ', ' + where + ' edge'}`, q => {
+    q.xform = { ...q.xform, pos: [pos.x, pos.y, pos.z].map(t => +t.toFixed(6)), rot: [e.x, e.y, e.z].map(r => { const g = +(r * 180 / Math.PI).toFixed(4); return Object.is(g, -0) ? 0 : g; }) };
+  });
+  fsnap.where = where;
+  snapBar.replaceChildren(h('span', {}, 'On the face:'),
+    seg([['center', 'Center'], ['left', 'Left'], ['right', 'Right'], ['top', 'Top'], ['bottom', 'Bottom']], where, w => placeSnap(w)),
+    button('Done', () => { endFaceSnap(); status('Snapped.'); }, { small: true }));
+  status(`${p.name} snapped onto the face${where === 'center' ? ', centered' : `, flush with its ${where} edge`}. Pick where on the face above, or Done.`);
+}
+
+// what each align button does, by axis, in words (low end, middle, high end)
+const ALIGN_WORDS = [['Left', 'Middle', 'Right'], ['Front', 'Middle', 'Back'], ['Bottom', 'Middle', 'Top']];
 function alignSel(axis, f) {
   const ids = editable();
   if (ids.length < 2) return;
@@ -1270,7 +2466,7 @@ function alignSel(axis, f) {
   let lo = Infinity, hi = -Infinity;
   for (const b of boxes.values()) { lo = Math.min(lo, b.min.getComponent(axis)); hi = Math.max(hi, b.max.getComponent(axis)); }
   const target = lo + (hi - lo) * f;
-  doc.update([...boxes.keys()], `Align ${'XYZ'[axis]} ${['min', 'mid', 'max'][f * 2]}`, p => {
+  doc.update([...boxes.keys()], `Align ${ALIGN_WORDS[axis][f * 2].toLowerCase()}${f === 0.5 ? ' in ' + 'XYZ'[axis] : ''}`, p => {
     const b = boxes.get(p.id), at = b.min.getComponent(axis) + (b.max.getComponent(axis) - b.min.getComponent(axis)) * f;
     p.xform.pos[axis] = +(p.xform.pos[axis] + target - at).toFixed(6);
     p.xform = snapped(p, p.xform);
@@ -1294,6 +2490,12 @@ function duplicateSel() {
   setSel(copies);
 }
 function copySel() { if (sel.length) { clipboard = sel.map(id => JSON.parse(JSON.stringify(doc.top(id)))); status(`Copied ${sel.length}.`); } }
+// Ctrl+C / X / V: the key handler takes them and stops the browser's own copy. Where the browser
+// takes the key first, its copy, cut and paste events still come here (not inside a text box).
+const clipTarget = e => !e.target.closest?.('input, textarea, [contenteditable]') && !document.querySelector('dialog[open]');
+document.addEventListener('copy', e => { if (clipTarget(e) && sel.length) { e.preventDefault(); copySel(); } });
+document.addEventListener('cut', e => { if (clipTarget(e) && sel.length) { e.preventDefault(); copySel(); deleteSel(); } });
+document.addEventListener('paste', e => { if (clipTarget(e) && clipboard) { e.preventDefault(); paste(); } });
 function paste() {
   if (!clipboard) return;
   const ids = [];
@@ -1319,7 +2521,7 @@ function startStep(t, partId) {
   renderInspector();
   stepCard.scrollIntoView({ block: 'nearest' });
   const m = meshes.get(partId);
-  const lb = m ? localBounds(m.tris) : null;
+  const lb = m ? stepBounds(p, m) : null;
   const api = {
     params: step.params, ui,
     set(k, v) { step.params[k] = v; stepChanged(); },
@@ -1334,8 +2536,8 @@ function startStep(t, partId) {
 
 function stepProblem() {
   if (!step) return null;
-  const m = meshes.get(step.partId);
-  return step.tool.validate?.(step.params, { model: m && { bounds: localBounds(m.tris) }, selection: step.face }) || null;
+  const m = meshes.get(step.partId), p = doc.top(step.partId);
+  return step.tool.validate?.(step.params, { model: m && p && { bounds: stepBounds(p, m) }, selection: step.face }) || null;
 }
 function stepChanged() {
   if (!step) return;
@@ -1343,7 +2545,8 @@ function stepChanged() {
   step.previewed = false;
   step.ui.hooks.update?.();
   const p = stepProblem();
-  step.ui.statusEl.replaceChildren(...(!p ? [] : p.wait ? [h('div', { class: 'note' }, p.wait)] : [errorLine(p)]));
+  const ui0 = step.ui;
+  whenFree(() => ui0.statusEl.replaceChildren(...(!p ? [] : p.wait ? [h('div', { class: 'note' }, p.wait)] : [errorLine(p)])));
   step.ui.applyBtn.disabled = !!p;
   if (step.tool.live && !p) { clearTimeout(step.timer); step.timer = setTimeout(previewStep, 200); }
 }
@@ -1359,7 +2562,8 @@ async function previewStep() {
   const my = ++step.seq, s = step;
   const p = doc.top(s.partId);
   const part = { ...p, ops: [...(p.ops || []), stepOp()] };
-  s.ui.prog.style.display = '';
+  whenFree(() => { if (my === s.seq) s.ui.prog.style.display = ''; });
+  s.running = (s.running || 0) + 1;
   try {
     await sendBlobs();
     const r = await pool.call('kern', { type: 'mesh', part }, [], (f, t) => { if (step === s && my === s.seq) { s.ui.prog.firstChild.style.width = `${Math.round(f * 100)}%`; status(`${s.tool.title}: ${t}...`); } });
@@ -1367,16 +2571,22 @@ async function previewStep() {
     meshes.set('preview', { key: shapeKey(part), tris: r.tris, volume: r.volume });
     viewer.preview(s.partId, r.tris);
     s.previewed = true;
-    s.ui.statusEl.replaceChildren(...(r.notes || []).map(t => h('div', { class: 'note' }, t)));
+    whenFree(() => s.ui.statusEl.replaceChildren(...(r.notes || []).map(t => h('div', { class: 'note' }, t))));
     status(`${s.tool.title}: preview ready. ${(r.notes || []).join(' ')} Apply keeps it.`);
   } catch (err) {
-    if (step === s) { const m = shortErr(err.message); s.ui.statusEl.replaceChildren(ui.tip(errorLine(m), err.message)); status(`${s.tool.title} did not finish.`, true); }   // the reason is in the panel, once
-  } finally { if (step === s) s.ui.prog.style.display = 'none'; }
+    if (step === s) { const m = shortErr(err.message); whenFree(() => s.ui.statusEl.replaceChildren(ui.tip(errorLine(m), err.message))); status(`${s.tool.title} did not finish.`, true); }   // the reason is in the panel, once
+  } finally {
+    s.running--;
+    if (step === s) whenFree(() => { if (my === s.seq) s.ui.prog.style.display = 'none'; });
+  }
 }
 async function applyStep() {
   if (!step || stepProblem()) return;
   const s = step;
-  if (!s.previewed) await previewStep();
+  // a live preview due from the last keystroke would start after this one and make it give up,
+  // leaving Apply undone: drop the timer, and try again if one already running took over
+  clearTimeout(s.timer);
+  for (let k = 0; k < 3 && step === s && !s.previewed; k++) await previewStep();
   if (step !== s || !s.previewed) return;
   const op = stepOp();
   const p = doc.top(s.partId);
@@ -1393,7 +2603,7 @@ function cancelStep() {
   viewer.setFacePick(null);
   clearTimeout(step.timer);
   step = null;
-  viewer.setHandles(sel.length === 1 && !past && !doc.top(sel[0])?.locked ? sel[0] : null);
+  showHandles();
   meshes.delete('preview');
   stepCard.replaceChildren();
 }
@@ -1538,10 +2748,86 @@ function localBounds(t) {
   for (let i = 0; i < t.length; i += 3) for (let a = 0; a < 3; a++) { lo[a] = Math.min(lo[a], t[i + a]); hi[a] = Math.max(hi[a], t[i + a]); }
   return { lo, hi };
 }
+// the panel asks for these on every redraw (live during a handle drag): one pass per mesh
+const lbSeen = new WeakMap();
+const boundsOf = m => { let b = lbSeen.get(m.tris); if (!b) lbSeen.set(m.tris, b = localBounds(m.tris)); return b; };
+/** The part's own box at its real size, as its steps see it (kernel local scales before steps). */
+function stepBounds(p, m) {
+  const b = boundsOf(m), k = (p.xform?.scale || [1, 1, 1]).map(Math.abs);
+  return { lo: b.lo.map((v, i) => v * k[i]), hi: b.hi.map((v, i) => v * k[i]) };
+}
 
 // ---- undo -----------------------------------------------------------------------------------
-function undo() { cancelStep(); const c = doc.undo(); if (c) status(`Undone: ${c.label}.`); }
-function redo() { cancelStep(); const c = doc.redo(); if (c) status(`Redone: ${c.label}.`); }
+// Ctrl+Z and Ctrl+Shift+Z: with parts selected, only they go back or forward; with none, the
+// whole model does (the last change, whatever it touched).
+// A step back takes every selected part back by one change of its own, all at once (two parts
+// moved one after the other both go back a move, not the later one all the way first): each finds
+// the last change that touched it and not yet stepped back, and is put as it was before it, all as
+// one new step (marked rewind, so the next Ctrl+Z looks past it). Parts such a change made or
+// removed (a group, its members) go with it, so nothing goes missing. A step forward puts the parts
+// of the last step back as those changes left them. A new change to a part drops its steps forward.
+function docUndo() { cancelStep(); const c = doc.undo(); if (c) status(`Undone: ${c.label}.`); }
+function docRedo() { cancelStep(); const c = doc.redo(); if (c) status(`Redone: ${c.label}.`); }
+function rewindIds(c, want) {
+  // the selected parts the change touched, and any it made or removed
+  return c.touched.filter(id => want.has(id) || !c.before[id] || !c.after[id]);
+}
+function setStates(label, states) {
+  doc.commit(label, parts => {
+    for (const [id, st] of states) {
+      const i = parts.findIndex(p => p.id === id);
+      if (st && i >= 0) parts[i] = structuredClone(st);
+      else if (st) parts.push(structuredClone(st));
+      else if (i >= 0) parts.splice(i, 1);
+    }
+  }, { kind: 'rollback', rewind: true });
+}
+function undo() {
+  const want = new Set(sel);
+  if (!want.size) { docUndo(); return; }
+  cancelStep();
+  const done = new Set(rewound.flatMap(r => r.steps.flatMap(s => s.ids.map(id => `${s.i}:${id}`))));
+  const steps = [], states = new Map();
+  for (const id of want) {
+    if (states.has(id)) continue;   // already taken back with another part's change
+    for (let i = doc.at - 1; i >= 0; i--) {
+      const c = doc.history[i];
+      if (c.rewind || !c.touched.includes(id) || done.has(`${i}:${id}`)) continue;
+      const ids = rewindIds(c, new Set([id])).filter(x => !states.has(x));
+      for (const x of ids) states.set(x, c.before[x]);
+      steps.push({ i, ids });
+      break;
+    }
+  }
+  if (!steps.length) { status('Nothing earlier for the selected part' + (want.size > 1 ? 's.' : '.')); return; }
+  const labels = [...new Set(steps.map(s => doc.history[s.i].label))];
+  setStates(`Step back ${states.size > 1 ? states.size + ' parts' : doc.find([...states.keys()][0])?.part.name || 'part'}: before "${labels.join('", "')}"`, [...states]);
+  rewound.push({ steps });
+  setSel(sel.filter(id => doc.top(id)));
+  status(`Stepped back: before "${labels.join('", "')}" (only the selected part${want.size > 1 ? 's' : ''}).`);
+}
+function redo() {
+  const want = new Set(sel);
+  if (!want.size) { docRedo(); return; }
+  cancelStep();
+  for (let k = rewound.length - 1; k >= 0; k--) {
+    const r = rewound[k], ids = r.steps.flatMap(s => s.ids);
+    if (!ids.some(id => want.has(id))) continue;
+    rewound.splice(k, 1);
+    const labels = [...new Set(r.steps.map(s => doc.history[s.i].label))];
+    setStates(`Step forward: "${labels.join('", "')}" again`, r.steps.flatMap(s => s.ids.map(id => [id, doc.history[s.i].after[id]])));
+    setSel([...new Set([...sel.filter(id => doc.top(id)), ...ids.filter(id => doc.top(id))])]);
+    status(`Stepped forward: "${labels.join('", "')}" again.`);
+    return;
+  }
+  status('Nothing later for the selected part' + (want.size > 1 ? 's.' : '.'));
+}
+// a new change to a part drops its steps forward; a whole-model undo or redo drops them all
+// (bound with each model, in bindDoc)
+function rewoundFollows(ev) {
+  if (ev.type === 'cmd' && !ev.cmd.rewind) rewound = rewound.filter(r => !r.steps.some(s => s.ids.some(id => ev.cmd.touched.includes(id))));
+  else if (ev.type === 'undo' || ev.type === 'redo') rewound = [];
+}
 
 // ---- project folder ------------------------------------------------------------------------
 function updateHeader() {
@@ -1554,6 +2840,8 @@ function updateHeader() {
     document.title = doc.history.length ? 'Not saved: Workingtitle3D' : 'Workingtitle3D';
     projBtn.style.display = doc.history.length ? '' : 'none';
   }
+  // there is work and nothing keeps it: a quiet line at the foot of the view says so
+  autosaveNote.style.display = !project && doc.history.length ? '' : 'none';
 }
 
 function watch(p) {
@@ -2441,8 +3729,12 @@ window.addEventListener('keydown', e => {
   const k = e.key.toLowerCase(), c = e.ctrlKey || e.metaKey, s = e.shiftKey;
   const act = fn => { e.preventDefault(); fn(); };
   if (c && k === 'z' && s) return act(redo);
+  // Ctrl+Z while drawing: first what is being drawn (a piece under way is dropped whole; in the 3D
+  // frame, its last step), and only then the last finished change
+  if (c && k === 'z' && drawing && (drawing.pts.length || drawing.mark)) return act(() => clearPiece(true));
+  if (c && k === 'z' && drawing?.tool === 'frame' && frame.hist.length) return act(() => frameBack());
+  if (c && k === 'z' && drawing?.tool === 'erase' && eraseLog.length) return act(() => eraseUndo());
   if (c && k === 'z') return act(undo);
-  if (c && k === 'y') return act(redo);
   if (c && k === 'a') return act(() => setSel(doc.parts.filter(p => !p.hidden).map(p => p.id)));
   if (c && k === 'g' && s) return act(ungroupSel);
   if (c && k === 'g') return act(() => groupSel());
@@ -2457,6 +3749,36 @@ window.addEventListener('keydown', e => {
   if (c && k === 'v') return act(paste);
   if (c && k === 'e') return act(() => exportModel(s));
   if (c && k === 'o') return act(openProject);
+  // Path open: its keys are its own (they lend L, A, C, R for as long as it is open)
+  if (drawing && !c) {
+    if (drawing.tool === 'frame') {
+      // the frame's own keys (lending D and F while it is in use)
+      if (k === 'd') return act(() => setFrameMode('draw'));
+      if (k === 'f') return act(() => setFrameMode('faces'));
+      if (k === 'b') return act(() => buildFrame());
+      if (k === 'g') return act(() => setFramePlate(!frame.plate));
+      if (k === ' ') return act(() => toggleFrameLock());
+      if (k === 'n' || k === 'enter') return act(() => frameEnter());
+      if (k === 'u' || k === 'backspace') return act(() => frameBack());
+      if (k === 'escape' && (frame.cur != null || frame.faceCur.length)) return act(() => { frame.cur = null; frame.faceCur = []; showFrame(null); });
+    }
+    if (k === 'e' && (drawing.tool === 'frame' || drawing.tool === 'pointer') && frameToEdit()) return act(() => editFrame(frameToEdit()));
+    const tool = { v: 'pointer', l: 'line', a: 'arc', c: 'circle', r: 'rect', k: 'erase', ...(path3dOn ? { 3: 'frame' } : {}) }[k];
+    if (tool) return act(() => setPathTool(tool));
+    if (k === 'p') return act(() => { stopPath(); status('Path closed.'); });
+    if (drawing.tool === 'erase') {
+      if (k === 'u' || k === 'backspace') return act(() => eraseUndo());
+      if (k === 'escape') return act(() => { stopPath(); status('Path closed.'); });
+    }
+    // Pointer and Delete: Path keeps only its tool keys; every other key does what it does without Path
+  }
+  if (drawing && !c && drawing.tool !== 'pointer' && drawing.tool !== 'erase') {
+    // letters first: Enter, Backspace and Esc mean things to the browser too (they still work)
+    if (k === 'f' || k === 'enter') return act(() => finishPiece(false));
+    if (k === 'u' || k === 'backspace') return act(() => pointBack());
+    if (k === 'x') return act(() => clearPiece(true));
+    if (k === 'escape') return act(() => { if (drawing.pts.length || drawing.mark) clearPiece(true); else { stopPath(); status('Path closed.'); } });
+  }
   if (placing && k === 'enter') return act(() => commitPlace(true));
   if (placing && k === 'escape') return act(cancelPlace);
   if (viewer.pickingFace && k === 'escape') return act(() => { viewer.pickingFace = false; status('Slide cancelled.'); });
@@ -2480,6 +3802,13 @@ window.addEventListener('keydown', e => {
     nudge(dir[0] * d, dir[1] * d, 0);
   });
   if (k === 'delete' || k === 'backspace') return act(deleteSel);
+  if (k === 'escape' && fsnap && !openMenu) return act(() => { endFaceSnap(); status('Snap faces ended.'); });
+  if (k === 'escape' && measureOn && !openMenu) return act(() => { if (mPts.length) { mPts = []; viewer.setMeasure([]); measureText(); } else setMeasure(false); });
+  if (k === 't') return act(() => setMeasure(!measureOn));
+  if (k === 'p') return act(() => startPath());
+  // L with several parts selected: the Align buttons light up, to show they are ready (again: off)
+  if (k === 'l' && !s && sel.length > 1) return act(() => { alignLit = !alignLit; renderInspector(); status(alignLit ? 'Align: pick a side or the middle in the panel. L again or Esc: off.' : 'Align off.'); });
+  if (k === 'escape' && alignLit) return act(() => { alignLit = false; renderInspector(); });
   if (k === 'escape') return act(() => { if (openMenu) closeMenus(); else if (colorFor) closeColors(true); else if (floatEl) closeFloat(); else if (gridPop.style.display !== 'none') showGridPop(false); else if (step) cancelStep(); else if (past) endPast(); else setSel([]); });
   if (k === 'f' && s) return act(startSlidePick);
   if (k === 'f') return act(() => viewer.view(null, sel));

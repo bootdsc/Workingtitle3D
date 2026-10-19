@@ -1,0 +1,32 @@
+Workingtitle3D
+Copyright (C) 2026 bootdsc
+
+Workingtitle3D is free and open source software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later version.
+
+Workingtitle3D is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the GNU Affero General Public License (the file LICENSE) for more details.
+
+Source: https://github.com/bootdsc/Workingtitle3D
+The built HTML file is minified; that repository is its Corresponding Source.
+
+
+YOUR MODELS
+
+Files you make with Workingtitle3D (models, exports, project folders) are yours. This
+licence does not cover them. Use them, share them and sell them as you like.
+
+
+EARLIER VERSIONS
+
+Versions up to and including 0.1.1 were released under the Apache License 2.0 with the
+Commons Clause License Condition v1.0. Copies of those versions keep those terms. Versions
+after 0.1.1 are under AGPL-3.0-or-later.
+
+
+BUNDLED LIBRARIES
+
+Bundled libraries keep their own licences (MIT, Apache-2.0, ISC, Boost 1.0, and LGPL-2.1 for
+the STEP reader occt-import-js with Open CASCADE Technology): see THIRD-PARTY-NOTICES.txt.

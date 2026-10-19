@@ -103,5 +103,41 @@ for (const kind of Object.keys(SHAPES)) {
   const r0 = report(await flatten([g], ctx)), o2 = { bridge: true }, r2 = report(await flatten([g], ctx, o2));
   ok('bridge joins a hole touching the walls', !r0.watertight && r2.watertight && o2.bridged > 0, `before ${describe(r0)}; after ${describe(r2)}, ${o2.bridged} edges`);
 }
+// steps run at the part's real size: a 10 mm box stretched to 30 mm in Z takes a 10 mm fillet
+// exactly as a 30 mm box does (it used to see 10 mm and refuse, or stretch the fillet 3x)
+{
+  const fil = { tool: 'edgeshaper', params: { kind: 'fillet', face: 'top', width: 10, height: 10, start: null } };
+  const S = (x, y, z) => ({ pos: [0, 0, 0], rot: [0, 0, 0], scale: [x, y, z] });
+  const a = report(await flatten([part('box', { x: 40, y: 30, z: 10 }, { xform: S(1, 1, 3), ops: [fil] })], ctx));
+  const b = report(await flatten([part('box', { x: 40, y: 30, z: 30 }, { ops: [fil] })], ctx));
+  ok('fillet on a part scaled 300% in Z', a.watertight && Math.abs(a.volume - b.volume) < 0.5, `${a.volume.toFixed(2)} vs ${b.volume.toFixed(2)}`);
+  // picked edge, stored unscaled: front edge of a 40 mm box stretched 2x in X = an 80 mm box's front edge
+  const pick = (w, extra) => part('box', { x: w, y: 20, z: 6 }, { ...extra, ops: [{ tool: 'edgeshaper', params: { kind: 'fillet', face: 'top', width: 2, height: 2, start: null, edges: 'only' }, sel: { segs: [[-w / 2, -10, w / 2, -10]] } }] });
+  const c = report(await flatten([pick(40, { xform: S(2, 1, 1) })], ctx)), d = report(await flatten([pick(80, {})], ctx));
+  ok('picked edge on a part scaled 200% in X', c.watertight && Math.abs(c.volume - d.volume) < 0.5, `${c.volume.toFixed(2)} vs ${d.volume.toFixed(2)}`);
+}
+// a flat part is hollowed exactly: box 40 x 30 x 10, wall 2 -> cavity 36 x 26 x 6 (sharp corners);
+// the top opened -> a 36 x 26 window through the 2 mm roof as well
+{
+  const hol = (sel, voxel = 1) => ({ tool: 'hollower', params: { wall: 2, voxel }, ...(sel ? { sel } : {}) });
+  const t0 = performance.now();
+  const closed = report((await partMesh(part('box', { x: 40, y: 30, z: 10 }, { ops: [hol()] }), ctx)).tris);
+  ok('flat part hollowed exactly, closed', closed.watertight && Math.abs(closed.volume - (12000 - 36 * 26 * 6)) < 1e-3, `vol ${closed.volume.toFixed(3)} vs 6384, ${closed.triangles} tris, ${(performance.now() - t0).toFixed(0)} ms`);
+  const top = { faces: [{ normal: [0, 0, 1], d: 10, point: [0, 0, 10] }] };
+  const open = report((await partMesh(part('box', { x: 40, y: 30, z: 10 }, { ops: [hol(top)] }), ctx)).tris);
+  ok('flat part hollowed exactly, top open', open.watertight && Math.abs(open.volume - (6384 - 36 * 26 * 2)) < 1e-3, `vol ${open.volume.toFixed(3)} vs 4512`);
+
+  // a shaped part too: box 40 x 30 x 20, top chamfer 4 x 4, wall 2. Across an edge the wall
+  // moves the 45 deg chamfer in by 2, so the cavity is a box 36 x 26 x 16 with a top chamfer of
+  // 2 sqrt 2 (worked: lines d = 2, z = 18, z = d + 16 - 2 sqrt 2 meet at d 2 and 4.83).
+  // A box L x W x H with a mitred top chamfer c: L W H minus L W c plus the frustum on top.
+  const chamfered = (L, W, H, c) => L * W * H - L * W * c + (c / 6) * (L * W + 4 * (L - c) * (W - c) + (L - 2 * c) * (W - 2 * c));
+  const expect = chamfered(40, 30, 20, 4) - chamfered(36, 26, 16, 2 * Math.SQRT2);
+  const cham = { tool: 'edgeshaper', params: { kind: 'chamfer', face: 'top', width: 4, height: 4, start: null } };
+  const t1 = performance.now();
+  const sh = await partMesh(part('box', { x: 40, y: 30, z: 20 }, { ops: [cham, hol()] }), { ...ctx, notes: [] });
+  const rs = report(sh.tris);
+  ok('shaped part hollowed exactly (chamfer)', rs.watertight && Math.abs(rs.volume - expect) < 0.05, `vol ${rs.volume.toFixed(3)} vs ${expect.toFixed(3)}, ${rs.triangles} tris, ${(performance.now() - t1).toFixed(0)} ms`);
+}
 console.log(fail ? `${fail} FAILED` : 'all passed');
 process.exit(fail ? 1 : 0);

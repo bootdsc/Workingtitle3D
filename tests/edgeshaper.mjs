@@ -1,7 +1,7 @@
 // Headless: shape test plates with every profile and face, check each result is a closed solid.
 // node tests/edgeshaper.mjs
 import { run } from '../src/tools/edgeshaper/compute.js';
-import { repair, report, describe } from '../src/core/meshcheck.js';
+import { repair, report, describe, featureEdges } from '../src/core/meshcheck.js';
 import { extrude, rect, circle } from './shapes.mjs';
 
 const parts = {
@@ -37,6 +37,16 @@ for (const [name, raw] of Object.entries(parts)) {
       if (!expected) { fail++; console.log(e.stack); }
     }
   }
+}
+// a smooth profile draws no feature lines of its own: on a disc with a hole, only the two
+// bottom rims (96 + 64 edges) are left. Terraced bands drew over 10,000.
+{
+  const { tris } = repair(parts.disc);
+  const out = (await run(tris.slice(), { kind: 'fillet', face: 'top', width: 3, height: 3, start: null }, noop)).tris;
+  const lines = featureEdges(out, 40).length / 6;
+  const ok = lines === 160;
+  if (!ok) fail++;
+  console.log(`${ok ? 'ok  ' : 'FAIL'} disc   fillet  smooth band: ${lines} feature lines, 160 expected (the bottom rims)`);
 }
 console.log(fail ? `${fail} FAILED` : 'all passed');
 process.exit(fail ? 1 : 0);

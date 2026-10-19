@@ -16,6 +16,9 @@ import { MeshBVH } from 'three-mesh-bvh';
 import { weld, ToolError, BigMap } from '../../core/meshcheck.js';
 import { problem } from './limits.js';
 import { decimate } from '../../core/decimate.js';
+import ClipperLib from 'clipper-lib';
+import { S, flatPart, shapedPart } from '../../core/flat.js';
+import { shapeOutline, inset } from '../../core/rings.js';
 
 const THIN_TOL = 0.01;         // mm: how far the thinned cavity may move from the one the grid made
 const TOP = 3;                // top cells are 2^3 = 8 voxels a side
@@ -61,6 +64,20 @@ export async function run(tris, p, ctx) {
     }
     return { list, n, d };
   });
+
+  // a flat part (an outline pushed straight up) is hollowed exactly, no grid
+  if (ctx.kernel?.M) {
+    let part = null;
+    try { part = flatPart(tris); } catch { /* not flat: the grid below */ }
+    if (part) return exactFlat(tris, part, faces, t, ctx);
+    // shaped by distance from its outline (a fillet, chamfer or cove round a plate): exact too
+    ctx.progress(0.05, 'reading the shape');
+    const shaped = shapedPart(tris);
+    if (shaped) {
+      const r = exactShaped(tris, shaped, faces, t, ctx);
+      if (r) return r;
+    }
+  }
 
   ctx.progress(0.02, 'indexing');
   const geo = (skipF) => {
@@ -225,11 +242,14 @@ export async function run(tris, p, ctx) {
   }
   if (!ct.n) throw new ToolError(`Nothing to hollow: the part is thinner than twice the wall (${(2 * t).toFixed(2)} mm) everywhere.`);
 
-  // The grid makes the cavity equally dense everywhere, flat walls as much as curves, so a
-  // coarse grid on a big part could still add millions of triangles. Thin it to the working
-  // tolerance (0.01 mm, measured both ways by decimate) before it is joined to the outside.
+  // The grid makes the cavity equally dense everywhere, flat walls as much as curves. Thinning
+  // it to the working tolerance (0.01 mm, measured both ways by decimate) is off unless a step
+  // asks for it (thin: true): on a 240 mm plate at 1 mm it took 189 s of a 193 s hollow (the
+  // tool seemed never to finish), and it merged the grid's small steps at inside corners into
+  // large flat triangles that read as teeth. Steps saved 2026-10-16 with thinning on by
+  // default build unthinned now; the shape is the same within 0.01 mm.
   const before = ct.n / 3;
-  if (p.thin !== false) {
+  if (p.thin === true) {
     ctx.progress(0.9, 'thinning the cavity');
     const soup = new Float32Array(ct.n * 3), ta = ct.a, va = cv.a;
     for (let q = 0; q < ct.n; q++) { const v = ta[q] * 3; soup[q * 3] = va[v]; soup[q * 3 + 1] = va[v + 1]; soup[q * 3 + 2] = va[v + 2]; }
@@ -281,6 +301,139 @@ export async function run(tris, p, ctx) {
     res[q * 3] = va[v]; res[q * 3 + 1] = va[v + 1]; res[q * 3 + 2] = va[v + 2];
   }
   return { tris: res, notes };
+}
+
+/**
+ * Hollow of a flat part, exact: the cavity is the outline shrunk by the wall, from one wall
+ * above the floor to one wall under the roof. Each opening is its picked face shrunk by the
+ * wall within its own plane, cut straight through. The solid engine takes all of it out of
+ * the part at once. Walls are true, corners sharp (round only where the outline turns inward),
+ * and the result is about as many triangles as the part.
+ */
+function exactFlat(tris, part, faces, t, ctx) {
+  const { M } = ctx.kernel;
+  const H = part.z1 - part.z0;
+  // only the walls that stay closed take height: an opened top or bottom has none, and the cavity
+  // runs out through it (a 4 mm tall box with both open is a ring, whatever the wall)
+  const flat = (F, s, z) => F.n[2] * s > 0.9999 && Math.abs(F.d - s * z) < 1e-4;
+  const openTop = faces.some(F => flat(F, 1, part.z1)), openBot = faces.some(F => flat(F, -1, part.z0));
+  const closed = (openTop ? 0 : 1) + (openBot ? 0 : 1);
+  if (H <= closed * t) throw new ToolError(`Nothing to hollow: the part is ${H.toFixed(2)} mm tall, no taller than its closed ${closed > 1 ? 'top and bottom walls' : openTop ? 'bottom wall' : 'top wall'} (${(closed * t).toFixed(2)} mm).`);
+  const z0 = part.z0 + (openBot ? -1 : t), z1 = part.z1 + (openTop ? 1 : -t);
+  const own = [];
+  try {
+    ctx.progress(0.2, 'the cavity');
+    const rings = part.region.flatMap(P => [P.outer, ...P.holes].map(r => r.map(q => [q.X / S, q.Y / S])));
+    const plan = new M.CrossSection(rings, 'EvenOdd'); own.push(plan);
+    const inner = plan.offset(-t, 'Round', 2, arcSegs(t)); own.push(inner);
+    if (inner.isEmpty()) throw new ToolError(`Nothing to hollow: the part is narrower than twice the wall (${(2 * t).toFixed(2)} mm) everywhere.`);
+    const cav = M.Manifold.extrude(inner, z1 - z0); own.push(cav);
+    // an open top or bottom is already open (the cavity runs out through it): no window cut there,
+    // which reaching one wall in from the face would carry through the floor of a shallow part
+    const rest = faces.filter(F => !(openTop && flat(F, 1, part.z1)) && !(openBot && flat(F, -1, part.z0)));
+    return cutOut(tris, cav.translate([0, 0, z0]), rest, t, ctx,
+      `Wall ${t.toFixed(2)} mm, exact: the part is flat, so the inside is its outline moved in by the wall (Detail is not used).`, faces.length - rest.length);
+  } finally { for (const x of own) x.delete(); }
+}
+
+/** Round inside corners within 0.01 mm of a true arc: segments in a full circle of radius t. */
+const arcSegs = t => Math.min(512, Math.max(16, Math.ceil((2 * Math.PI) / Math.acos(1 - Math.min(0.01 / t, 1)))));
+
+/**
+ * Hollow of a shaped flat part, exact: its section (height against distance in from the
+ * outline) is moved in by the wall in two dimensions, which is exactly what the wall is across
+ * a straight edge, and the cavity is that section's profile built round the outline moved in
+ * by the wall, the way the edge shaper builds the part itself. null if the section cannot be
+ * read back as a single cavity (the grid does those).
+ */
+function exactShaped(tris, part, faces, t, ctx) {
+  const H = part.z1 - part.z0;
+  // too thin for a floor and a roof: the grid decides (it knows which faces are open, and says so)
+  if (H <= 2 * t) return null;
+  ctx.progress(0.2, 'the cavity');
+  // the section, counter-clockwise in (distance, height): along the bottom, up the far end, back
+  // along the top, down the outside wall; carried well past where both faces go flat
+  const top = part.top || [[0, H]], bottom = part.bottom || [[0, 0]];
+  const D = Math.max(top[top.length - 1][0], bottom[bottom.length - 1][0]) + 2 * t + 2;
+  const sec = [...bottom, [D, 0], [D, H], ...top.slice().reverse()];
+  const P = sec.map(([d, z]) => ({ X: Math.round(d * S), Y: Math.round(z * S) }));
+  const co = new ClipperLib.ClipperOffset(2, 0.01 * S);
+  co.AddPath(P, ClipperLib.JoinType.jtRound, ClipperLib.EndType.etClosedPolygon);
+  const res = new ClipperLib.Paths();
+  co.Execute(res, -t * S);
+  if (res.length !== 1) return null;   // the cavity's section is not one piece
+  const Q = res[0].map(q => [q.X / S - t, q.Y / S - t]);   // distance in from the cavity's outline, height above its floor
+  if (ClipperLib.Clipper.Area(res[0]) < 0) Q.reverse();
+  // the cavity's two profiles: from its outline wall (d = 0) in, along the top and the bottom
+  const n = Q.length, tc = H - 2 * t;
+  let iL = 0, iR = 0;
+  for (let i = 1; i < n; i++) {
+    if (Q[i][0] < Q[iL][0] - 1e-6 || (Math.abs(Q[i][0] - Q[iL][0]) <= 1e-6 && Q[i][1] < Q[iL][1])) iL = i;   // bottom of the outline wall
+    if (Q[i][0] > Q[iR][0] + 1e-6 || (Math.abs(Q[i][0] - Q[iR][0]) <= 1e-6 && Q[i][1] < Q[iR][1])) iR = i;   // bottom of the far end
+  }
+  const walk = (from, to) => { const out = []; for (let i = from; ; i = (i + 1) % n) { out.push(Q[i]); if (i === to) break; } return out; };
+  const lower = walk(iL, iR);                       // along the bottom, distance rising
+  const upper = walk(iR, iL).reverse();             // the far end, the top, the wall: turned round
+  const wallTop = upper.findIndex(([d], i) => i > 0 && d > 1e-6) - 1;   // last point of the outline wall
+  const prof = (pts, flatAt) => {
+    const out = [];
+    for (const [d, z] of pts) {
+      out.push([Math.max(0, d), Math.abs(z - flatAt) < 1e-4 ? flatAt : z]);
+      if (Math.abs(z - flatAt) < 1e-4 && d > 1e-6) break;
+    }
+    out[0][0] = 0;
+    return out.length > 1 && Math.abs(out[out.length - 1][1] - flatAt) < 1e-4 ? out : null;
+  };
+  const topC = Math.abs(upper[Math.max(0, wallTop)][1] - tc) < 1e-4 ? null : prof(upper.slice(Math.max(0, wallTop)), tc);
+  const botC = Math.abs(lower[0][1]) < 1e-4 ? null : prof(lower, 0);
+  if ((part.top && !topC && Math.abs(upper[Math.max(0, wallTop)][1] - tc) >= 1e-4) || (part.bottom && !botC && Math.abs(lower[0][1]) >= 1e-4)) return null;
+  const base = inset(part.region, t);
+  if (!base.length) throw new ToolError(`Nothing to hollow: the part is narrower than twice the wall (${(2 * t).toFixed(2)} mm) everywhere.`);
+  const cavTris = shapeOutline(base, part.z0 + t, tc, topC, botC);
+  const cav = ctx.kernel.toManifold(cavTris);
+  try {
+    return cutOut(tris, cav, faces, t, ctx,
+      `Wall ${t.toFixed(2)} mm, exact: the inside follows the part's shaped edge, moved in by the wall (Detail is not used).`);
+  } finally { cav.delete(); }
+}
+
+/** The part with a cavity (a solid, not consumed) and an opening through each picked face cut away. */
+function cutOut(tris, cavity, faces, t, ctx, first, already = 0) {   // already: faces the cavity opens itself
+  const { M, toManifold, toTris } = ctx.kernel;
+  const segs = arcSegs(t);
+  const own = [];
+  try {
+    const parts = [cavity];
+    const notes = [first];
+    faces.forEach((F, k) => {
+      ctx.progress(0.4 + 0.3 * (k / faces.length), 'openings');
+      // the face in its own plane: u, v across it, n out of it (u x v = n, so faces stay counter-clockwise)
+      const n = F.n, a = Math.abs(n[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+      let u = [a[1] * n[2] - a[2] * n[1], a[2] * n[0] - a[0] * n[2], a[0] * n[1] - a[1] * n[0]];
+      const ul = Math.hypot(...u); u = u.map(x => x / ul);
+      const v = [n[1] * u[2] - n[2] * u[1], n[2] * u[0] - n[0] * u[2], n[0] * u[1] - n[1] * u[0]];
+      const polys = F.list.map(f => [0, 3, 6].map(o => {
+        const i = f * 9 + o;
+        return [tris[i] * u[0] + tris[i + 1] * u[1] + tris[i + 2] * u[2], tris[i] * v[0] + tris[i + 1] * v[1] + tris[i + 2] * v[2]];
+      }));
+      const face = new M.CrossSection(polys, 'Positive'); own.push(face);
+      const win = face.offset(-t, 'Round', 2, segs); own.push(win);
+      if (win.isEmpty()) { notes.push(`Face ${k + 1} is too small to open with a ${t} mm wall round it: left closed.`); return; }
+      // from just past the wall (0.05 mm into the cavity, which is exactly one wall in) to 1 mm
+      // outside the face. (1 mm in went through the floor of a part under a wall plus 1 mm deep.)
+      const bar = M.Manifold.extrude(win, t + 1.05); own.push(bar);
+      const o = F.d - t - 0.05;
+      const tunnel = bar.transform([u[0], u[1], u[2], 0, v[0], v[1], v[2], 0, n[0], n[1], n[2], 0, n[0] * o, n[1] * o, n[2] * o, 1]);
+      own.push(tunnel); parts.push(tunnel);
+    });
+    ctx.progress(0.75, 'cutting');
+    const hole = M.Manifold.union(parts); own.push(hole);
+    const outer = toManifold(tris); own.push(outer);
+    const res = outer.subtract(hole); own.push(res);
+    const opened = parts.length - 1 + already;
+    notes.push(opened ? `${opened} face${opened > 1 ? 's' : ''} opened.` : 'Closed hollow: pick faces in the view to open it through them.');
+    return { tris: toTris(res), notes };
+  } finally { for (const x of own) x.delete(); }
 }
 
 /** A typed list that grows by doubling: no limit on length but memory. */

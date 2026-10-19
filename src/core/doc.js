@@ -8,10 +8,12 @@ const clone = o => JSON.parse(JSON.stringify(o));
 
 /** What decides a part's shape in its own frame (not where it sits, not its name). */
 export function shapeKey(p) {
+  // steps run at the part's real size (kernel local), so with steps its scale is part of the shape
+  const ops = p.ops?.length ? JSON.stringify(p.ops) + JSON.stringify((p.xform?.scale || [1, 1, 1]).map(Math.abs)) : '[]';
   if (p.kind === 'group') {
-    return 'g' + (p.mode || '') + '[' + p.children.map(c => (c.hole ? 'h' : 's') + JSON.stringify(c.xform) + shapeKey(c)).join(',') + ']' + JSON.stringify(p.ops || []);
+    return 'g' + (p.mode || '') + '[' + p.children.map(c => (c.hole ? 'h' : 's') + JSON.stringify(c.xform) + shapeKey(c)).join(',') + ']' + ops;
   }
-  return p.kind + JSON.stringify(p.params || {}) + (p.blob || '') + JSON.stringify(p.ops || []);
+  return p.kind + JSON.stringify(p.params || {}) + (p.blob || '') + ops;
 }
 /** What makes a part's form: its shape, turn, scale and solid or hole. Not where it sits,
  *  its name, color, or whether it is hidden or locked. A part's history is its forms. */

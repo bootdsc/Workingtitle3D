@@ -58,8 +58,9 @@ async function build() {
   const m = await esbuild.build({ ...common, entryPoints: [path.join(src, 'core', 'main.js')], plugins: [virtuals(workerSource, cadSource)] });
   const js = m.outputFiles[0].text.replace(/<\/script/gi, '<\\/script');
   const css = fs.readFileSync(path.join(src, 'core', 'theme.css'), 'utf8');
-  // the licences travel inside the one file: ours, and every bundled library's (their terms ask for it)
-  const legal = ['LICENSE', 'THIRD-PARTY-NOTICES.txt'].map(f => fs.readFileSync(path.join(root, f), 'utf8')).join('\n\n')
+  // the licences travel inside the one file: our notice and licence (AGPL-3.0-or-later), and every
+  // bundled library's (their terms ask for it)
+  const legal = ['NOTICE', 'LICENSE', 'THIRD-PARTY-NOTICES.txt'].map(f => fs.readFileSync(path.join(root, f), 'utf8')).join('\n\n')
     .replace(/<\/script/gi, '<\\/script');
   const html = fs.readFileSync(path.join(src, 'index.html'), 'utf8')
     .replace('/*CSS*/', () => css)

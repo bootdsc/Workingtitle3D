@@ -95,13 +95,23 @@ To build it yourself:
 The two browser tests need PUPPETEER_DIR and CHROME_DIR set.
 
 ## Licence
-Source-available: Apache License 2.0 with the Commons Clause. Use it for personal and
-commercial work alike. The models you make are yours alone to keep, sell or otherwise do as you please. 
-Forking and making derivatives does not give you any right to sell this software or any derivative, add any paid subscriptions or features. 
-Workingtitle3D is free, forever. Full terms in LICENSE.
+Free and open source: GNU Affero General Public License, version 3 or later
+(AGPL-3.0-or-later). Use it, study it, change it and share it, for personal and commercial
+work alike. If you pass on a changed version, or let people use one over a network, you must
+offer them its full source under the same licence. Full terms in LICENSE; the notice in NOTICE.
 
-Bundled libraries keep their own licences (MIT, Apache-2.0, ISC, Boost 1.0), listed in
-THIRD-PARTY-NOTICES.txt and carried inside the built HTML file.
+The models you make are yours alone to keep, sell or otherwise do as you please. The licence
+does not cover them.
+
+Source: https://github.com/bootdsc/Workingtitle3D (the built HTML file is minified; this
+repository is its source).
+
+Versions up to 0.1.1 were released under Apache License 2.0 with the Commons Clause, and
+copies of those keep those terms. Later versions are under AGPL-3.0-or-later.
+
+Bundled libraries keep their own licences: MIT, Apache-2.0, ISC and Boost 1.0, and LGPL-2.1
+for the STEP reader (occt-import-js, with Open CASCADE Technology). They are listed in
+THIRD-PARTY-NOTICES.txt, which is carried inside the built HTML file.
 
 ## Acknowledgements
 Designed by Bootdsc, encabulated by Claude.

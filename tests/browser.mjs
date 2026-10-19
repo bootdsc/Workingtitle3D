@@ -197,9 +197,10 @@ try {
   await shot('4-scene-1920');
   await page.setViewport({ width: 1366, height: 768 });
 
-  // color: one button with the color's name; its list opens to the left of the panel and the
-  // panel does not move; a part with no color reads Gray
-  const name0 = await page.$eval('.inspector .colorbtn', e => e.textContent);
+  // color: one button reading "Color", the color's name in its tooltip; its list opens to the left
+  // of the panel and the panel does not move; a part with no color reads Gray
+  const colorOf = () => page.$eval('.inspector .colorbtn', e => e.textContent === 'Color' ? e.title.replace(/^Color: (.*?)\. .*$/, '$1') : 'button text ' + e.textContent);
+  const name0 = await colorOf();
   const panelH0 = await page.$eval('aside .pane:not([style*="none"])', e => e.scrollHeight);
   await page.click('.inspector .colorbtn');
   await sleep(200);
@@ -208,7 +209,7 @@ try {
   await shot('4a-color-list');
   for (const b of await page.$$('.colorfly .citem')) if ((await b.evaluate(n => n.textContent)).endsWith('Red')) { await b.click(); break; }
   await sleep(400);
-  const name1 = await page.$eval('.inspector .colorbtn', e => e.textContent);
+  const name1 = await colorOf();
   step('color: named button, list left of the panel, panel still', name0 === 'Gray' && name1 === 'Red' && fly.shown && fly.right <= fly.left && fly.bottom <= fly.h && panelH1 === panelH0,
     `${name0} -> ${name1}; list right ${fly.right} vs panel ${fly.left}; panel ${panelH0} -> ${panelH1}`);
 
@@ -321,12 +322,10 @@ try {
   await sleep(600);
   const fv = async l => page.$$eval('.inspector .field', (fs, l) => +fs.find(f => f.querySelector('label').textContent === l)?.querySelector('input').value, l);
   const cx0 = await fv('Center X'), z0 = await fv('Bottom Z');
-  const rotX = await page.$$('.inspector .field');
-  for (const f of rotX) {
-    const lab = await f.$eval('label', l => l.textContent);
-    const sub = await f.evaluate(n => { let s = n.previousElementSibling; while (s && !s.classList.contains('sub')) s = s.previousElementSibling; return s?.textContent || ''; });
-    if (lab === 'X' && sub.startsWith('Rotation')) { const i = await f.$('input'); await i.click(); await i.type('45'); await i.press('Enter'); break; }
-  }
+  // the Rotation row: a heading, then X Y Z boxes on one row
+  const rotX = await page.evaluateHandle(() => [...document.querySelectorAll('.inspector .trio')].find(t => t.querySelector('.sub')?.textContent.startsWith('Rotation'))?.querySelector('.trio-row input'));
+  const rotIn = rotX.asElement();
+  if (rotIn) { await rotIn.click({ clickCount: 3 }); await rotIn.type('45'); await rotIn.press('Enter'); }
   await sleep(500);
   const cx1 = await fv('Center X'), z1 = await fv('Bottom Z');
   step('rotate about the middle', Math.abs(cx1 - cx0) < 1e-3 && Math.abs(z1 - (10 - 10 * Math.SQRT2)) < 0.01 && z0 === 0, `centre X ${cx0} -> ${cx1}, bottom Z ${z0} -> ${z1}`);
@@ -370,6 +369,17 @@ try {
   const rz = await fv('Z');
   step('Z ring turns in 15 degree steps', Math.abs(Math.abs(rz) - 90) < 1e-3, `rotation Z ${rz}`);
   await shot('5c-handles');
+  // the Rotation Rings button: lit and the rings on until pressed again, through a change of part
+  const ringState = () => page.evaluate(() => { const b = [...document.querySelectorAll('.inspector .btn')].find(n => n.textContent === 'Rotation Rings'); return { on: document.getElementById('view').viewer.ringsOn, lit: !!b?.classList.contains('go'), found: !!b }; });
+  await click('.inspector .btn', 'Rotation Rings'); await sleep(200);
+  const rOn = await ringState();
+  await addShape('Cylinder'); await sleep(600);
+  const rKept = await ringState();
+  await click('.inspector .btn', 'Rotation Rings'); await sleep(200);
+  const rOff = await ringState();
+  await keys('Control', 'z'); await sleep(500);   // the cylinder away again: later steps count parts
+  step('Rotation Rings button: lit while on, stays on for another part, off when pressed again',
+    rOn.on && rOn.lit && rKept.on && rKept.lit && !rOff.on && !rOff.lit, JSON.stringify({ rOn, rKept, rOff }));
 
   // edge shaper on one picked wall: a fresh 20 mm box, fillet the top edge of its front wall only
   await addShape('Box');
@@ -479,10 +489,14 @@ try {
   await page.keyboard.press('Enter');
   await sleep(800);
   await shot('shape-tab-opts');
-  const onShapes = await page.evaluate(() => { const o = document.querySelector('.pane .shapes').closest('.pane').querySelector('.shapeopts');
-    return o.style.display !== 'none' && !!o.querySelector('.inspector') && /Diameter/.test(o.textContent) && /Color/.test(o.textContent); });
+  // (the Shapes card heads both tabs and moves with them: the pane shown is the one to read)
+  const shownOpts = () => page.evaluate(() => { const pane = [...document.querySelectorAll('aside .pane')].find(p => p.style.display !== 'none'); const o = pane?.querySelector('.shapeopts');
+    return o ? { shown: o.style.display !== 'none', inspector: !!o.querySelector('.inspector') && o.querySelector('.inspector').style.display !== 'none', text: o.textContent } : null; });
+  const s = await shownOpts();
+  const onShapes = !!s && s.shown && s.inspector && /Diameter/.test(s.text) && /Color/.test(s.text);
   await click('.tabs button', 'Parts');
-  const onParts = await page.evaluate(() => { const o = document.querySelector('.pane:not(:has(.shapes)) .shapeopts'); return o.style.display !== 'none' && !!o.querySelector('.inspector') && o.querySelector('.inspector').style.display !== 'none'; });
+  const pp = await shownOpts();
+  const onParts = !!pp && pp.shown && pp.inspector && /Diameter/.test(pp.text);
   step('options under Shape tools after adding, then on Parts', onShapes && onParts, `${onShapes} ${onParts}`);
 
   // a driver reset (resume from sleep) loses the GL context: say so, then redraw on restore

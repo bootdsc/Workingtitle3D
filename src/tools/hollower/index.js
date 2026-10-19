@@ -14,7 +14,7 @@ export default {
   live: false,
   needsFace: true,
   multiFace: true,   // every face clicked is an opening; none is a closed hollow
-  defaults: { wall: 2.4, voxel: 0.2 },
+  defaults: { wall: 2.4, voxel: 1 },
   stepLabel: p => `Hollow, wall ${p.wall} mm`,
 
   validate(p) { return problem(p) || null; },
@@ -22,6 +22,9 @@ export default {
   panel(el, api) {
     const { ui, params: p } = api;
     const faceLine = ui.h('div', { class: 'note' });
+    // finer than 1 mm is allowed, with a warning: the inside grows to millions of triangles
+    const fine = ui.h('div', { class: 'note' });
+    const warn = () => { fine.textContent = p.voxel < 1 ? 'Warning: detail under 1 mm makes a very complex file (millions of triangles), slow to build and to export.' : ''; };
     const update = () => {
       const s = api.selection();
       const k = s?.faces?.length || 0;
@@ -29,9 +32,11 @@ export default {
     };
     el.append(
       ui.numfield('Wall thickness', p.wall, 'mm', v => api.set('wall', v), { min: 0.001, step: 0.2, digits: 3 }),
-      ...gridPicker(ui, p.voxel, v => api.set('voxel', v)),
+      ...gridPicker(ui, p.voxel, v => { api.set('voxel', v); warn(); }),
+      fine,
       faceLine,
     );
+    warn();
     update();
     return { update };
   },
